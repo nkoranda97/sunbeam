@@ -416,12 +416,11 @@ class LogHandler(LogHandlerBase):
     def _add_log_line(self, renderable: Any) -> None:
         """Queue a Rich renderable into the in-frame log pane.
 
-        In TTY mode: always buffer — shown in the LOG pane, never printed to the raw
-        terminal (keeps the screen clean before and after the TUI).
-        In non-TTY mode (CI, pipes, tests): always print directly so log files and test
-        assertions still capture content.
+        While the TUI is running: buffer into _log_lines (shown in the LOG pane).
+        Otherwise (pre-TUI, post-TUI, CI, tests): print directly to the console so
+        critical messages — including DAG errors before any jobs start — are never lost.
         """
-        if self.console.is_terminal:
+        if self._live is not None and self._live.is_started:
             self._log_lines.append(renderable)
         else:
             self.console.print(renderable)
