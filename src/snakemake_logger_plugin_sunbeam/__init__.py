@@ -279,9 +279,10 @@ class LogHandler(LogHandlerBase):
             if handler is not None:
                 handler(record)
             else:
-                # Unknown/uncategorized log — queue into the log pane.
                 msg = self.format(record)
                 if msg:
+                    # Parse Slurm submission messages to label active jobs with real rule names.
+                    self._maybe_update_job_from_slurm_msg(msg)
                     self._add_log_line(Text(msg, style=C_INK_SOFT))
         except Exception:
             self.handleError(record)
@@ -922,6 +923,38 @@ class LogHandler(LogHandlerBase):
         except Exception:
             return str(p)
 
+    def _maybe_update_job_from_slurm_msg(self, msg: str) -> None:
+        """Parse Slurm submission messages to back-fill rule/wildcard info.
+
+        The Slurm executor logs e.g.:
+          Job 22 has been submitted with SLURM jobid 48989767
+          (log: .../.snakemake/slurm_logs/rule_align_pe/TEAD1-2/48989767.log).
+        We extract the Snakemake job ID (22), the rule name (align_pe), and the
+        wildcard string (TEAD1-2) and update the already-running _JobEntry.
+        """
+        m = re.search(
+            r"Job\s+(\d+)\s+has been submitted.*?slurm_logs/rule_([^/]+)/([^/]+)/",
+            msg,
+        )
+        if not m:
+            return
+        jid = int(m.group(1))
+        rule = m.group(2)
+        wc = m.group(3)
+        je = self._active_jobs.get(jid)
+        if je is None:
+            return
+        old_rule = je.rule
+        je.rule = rule
+        je.wildcards_str = wc
+        # Fix rule running-counts: the placeholder was skipped, now count the real rule.
+        if old_rule != rule:
+            if old_rule in self._rule_stats and self._rule_stats[old_rule].running > 0:
+                self._bump_rule(old_rule, running_delta=-1)
+            self._bump_rule(rule, running_delta=1)
+        if self._live is not None:
+            self._refresh()
+
     def _push_event(self, glyph: str, kind: str, markup: str) -> None:
         self._events.append(_EventEntry(time.strftime("%H:%M"), glyph, kind, markup))
 
@@ -957,8 +990,19 @@ class LogHandler(LogHandlerBase):
             self._refresh()
 
     def _handle_run_info(self, record: LogRecord) -> None:
-        per_rule: dict[str, int] = getattr(record, "per_rule_job_counts", {}) or {}
-        total: int = getattr(record, "total_job_count", 0) or 0
+        # Local executor: per_rule_job_counts + total_job_count
+        # Cluster executor (Slurm): stats dict with rule names and a 'total' key
+        per_rule: Optional[dict[str, int]] = getattr(record, "per_rule_job_counts", None)
+        total: Optional[int] = getattr(record, "total_job_count", None)
+        if per_rule is None:
+            raw = getattr(record, "stats", None)
+            if isinstance(raw, dict):
+                total = int(raw.get("total", 0))
+                per_rule = {k: int(v) for k, v in raw.items() if k != "total"}
+            else:
+                per_rule, total = {}, 0
+        per_rule = per_rule or {}
+        total = total or 0
         self._total_jobs = total
         for rule_name, count in per_rule.items():
             self._rule_stats.setdefault(rule_name, _RuleStats()).total = count
@@ -1076,14 +1120,19 @@ class LogHandler(LogHandlerBase):
             self._refresh()
 
     def _handle_job_started(self, record: LogRecord) -> None:
-        job_ids: list[int] = getattr(record, "job_ids", []) or []
+        # Local executor uses 'job_ids'; Slurm executor uses 'jobs'.
+        raw = getattr(record, "jobs", None) or getattr(record, "job_ids", None) or []
+        job_ids: list[int] = list(raw) if raw else []
         self._ensure_live()
         for jid in job_ids:
             spec = self._job_specs.pop(jid, None) or _JobEntry(job_id=jid, rule=f"job_{jid}")
             spec.started_at = time.time()
             spec.state = "running"
             self._active_jobs[jid] = spec
-            self._bump_rule(spec.rule, running_delta=1)
+            # Only bump the rule counter if we have a real rule name; placeholder names
+            # get updated (and counted) later when the Slurm submission message arrives.
+            if spec.rule in self._rule_stats:
+                self._bump_rule(spec.rule, running_delta=1)
             self._push_event("▸", "ok", f"job [bold]#{jid}[/] started · [{C_AMBER}]{spec.rule}[/]")
         self._refresh()
 
