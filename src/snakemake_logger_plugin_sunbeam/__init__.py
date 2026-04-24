@@ -205,6 +205,7 @@ class LogHandler(LogHandlerBase):
         self._verbose_override: bool = False   # toggled by 'v' key
         self._filter_active: bool = False      # True while '/' mode is on
         self._filter_text: str = ""            # characters accumulated after '/'
+        self._quit_pending: bool = False       # True after first 'q', waiting for confirm
 
         # Run state
         self._workflow_name: str = "workflow"
@@ -393,9 +394,16 @@ class LogHandler(LogHandlerBase):
                     self._filter_active = bool(self._filter_text)
                 elif ch.isprintable():
                     self._filter_text += ch
+            elif self._quit_pending:
+                if ch in ("q", "Q"):                    # confirmed
+                    self._quit_pending = False
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+                else:                                   # any other key cancels
+                    self._quit_pending = False
             else:
                 if ch in ("q", "Q"):
-                    os.kill(os.getpid(), signal.SIGINT)
+                    self._quit_pending = True           # first press: arm confirmation
                 elif ch in ("v", "V"):
                     self._verbose_override = not self._verbose_override
                 elif ch == "/":
@@ -408,9 +416,12 @@ class LogHandler(LogHandlerBase):
     def _add_log_line(self, renderable: Any) -> None:
         """Queue a Rich renderable into the in-frame log pane.
 
-        Falls back to direct console.print when Live is not active (tests, CI, pre-TUI phase).
+        In TTY mode: always buffer — shown in the LOG pane, never printed to the raw
+        terminal (keeps the screen clean before and after the TUI).
+        In non-TTY mode (CI, pipes, tests): always print directly so log files and test
+        assertions still capture content.
         """
-        if self._live is not None and self._live.is_started:
+        if self.console.is_terminal:
             self._log_lines.append(renderable)
         else:
             self.console.print(renderable)
@@ -532,8 +543,15 @@ class LogHandler(LogHandlerBase):
             filter_active = self._filter_active
             filter_text = self._filter_text
             verbose_on = self._verbose_override
+            quit_pending = self._quit_pending
         right = Text()
-        if filter_active:
+        if quit_pending:
+            right.append(" QUIT? ", style=f"bold {C_INK} on {C_ROSE}")
+            right.append("  q  ", style=f"bold {C_ROSE} on {C_LINE}")
+            right.append(" confirm  ", style=C_ROSE)
+            right.append(" ESC ", style=f"{C_INK_SOFT} on {C_LINE}")
+            right.append(" cancel  ", style=C_INK_FAINT)
+        elif filter_active:
             right.append(" / ", style=f"bold {C_AMBER} on {C_LINE}")
             right.append(f" {filter_text}", style=C_INK)
             right.append("█", style=C_AMBER)
@@ -700,54 +718,66 @@ class LogHandler(LogHandlerBase):
         return tbl
 
     def _render_jobs_panel(self) -> Any:
+        n_running = len(self._active_jobs)
+        n_submitted = len(self._job_specs)
         right = Text()
-        right.append(f"{len(self._active_jobs)} running", style=C_AMBER)
+        right.append(f"{n_running} running", style=C_AMBER)
+        if n_submitted:
+            right.append(" · ", style=C_INK_FAINT)
+            right.append(f"{n_submitted} submitted", style=C_SKY)
         right.append(" · ", style=C_INK_FAINT)
         total = self._total_jobs
-        queued = max(0, total - self._jobs_done - self._jobs_failed - len(self._active_jobs))
+        queued = max(0, total - self._jobs_done - self._jobs_failed - n_running - n_submitted)
         right.append(f"{queued} queued", style=C_INK_SOFT)
         header = self._render_section_title("ACTIVE JOBS", right)
         rows: list[Any] = [header]
         with self._kb_lock:
             f_active = self._filter_active
             f_text = self._filter_text.lower()
-        if not self._active_jobs:
-            rows.append(Padding(Text("  (no active jobs)", style=C_INK_FAINT), (0, 0, 0, 0)))
-        else:
-            spinner = _spinner_frame()
-            matched = 0
-            for jid in sorted(self._active_jobs.keys()):
-                je = self._active_jobs[jid]
-                if f_active and f_text:
-                    if f_text not in f"{je.rule} {je.wildcards_str}".lower():
-                        continue
-                matched += 1
-                rows.append(self._render_job_row(je, spinner))
-            if f_active and f_text and matched == 0:
+        spinner = _spinner_frame()
+        matched = 0
+        for jid in sorted(self._active_jobs.keys()):
+            je = self._active_jobs[jid]
+            if f_active and f_text and f_text not in f"{je.rule} {je.wildcards_str}".lower():
+                continue
+            matched += 1
+            rows.append(self._render_job_row(je, spinner, submitted=False))
+        for jid in sorted(self._job_specs.keys()):
+            je = self._job_specs[jid]
+            if f_active and f_text and f_text not in f"{je.rule} {je.wildcards_str}".lower():
+                continue
+            matched += 1
+            rows.append(self._render_job_row(je, "→", submitted=True))
+        if matched == 0:
+            if f_active and f_text:
                 rows.append(Padding(
                     Text(f"  (no jobs matching \"{f_text}\")", style=C_INK_FAINT),
                     (0, 0, 0, 0),
                 ))
+            else:
+                rows.append(Padding(Text("  (no active jobs)", style=C_INK_FAINT), (0, 0, 0, 0)))
         return Group(*rows)
 
-    def _render_job_row(self, je: _JobEntry, spinner: str) -> Any:
+    def _render_job_row(self, je: _JobEntry, spinner: str, submitted: bool = False) -> Any:
         elapsed = _mono_elapsed(time.time() - je.started_at)
         with self._kb_lock:
             show_res = self._verbose_override or bool(self.common_settings.verbose)
         row = Table.grid(expand=True, padding=(0, 1))
-        row.add_column(width=2, no_wrap=True)    # spinner
+        row.add_column(width=2, no_wrap=True)    # spinner / status icon
         row.add_column(width=5, no_wrap=True)    # #id
         row.add_column(ratio=1)                  # rule + wildcards
         row.add_column(no_wrap=True)             # resources (hidden unless verbose)
         row.add_column(width=6, no_wrap=True, justify="right")  # timer
-        spin = Text(spinner, style=C_AMBER)
+        spin = Text(spinner, style=C_SKY if submitted else C_AMBER)
         idt = Text(f"#{je.job_id:02d}", style=C_INK_FAINT)
         rule_txt = Text()
-        rule_txt.append(je.rule, style=f"bold {C_INK}")
+        name_style = C_INK_DIM if submitted else f"bold {C_INK}"
+        rule_txt.append(je.rule, style=name_style)
         if je.wildcards_str:
             rule_txt.append(f"  {je.wildcards_str}", style=C_INK_DIM)
         res = Text(je.resources_str, style=C_INK_FAINT) if show_res else Text("")
-        timer = Text(elapsed, style=C_AMBER)
+        timer_style = C_INK_DIM if submitted else C_AMBER
+        timer = Text(elapsed, style=timer_style)
         row.add_row(spin, idt, rule_txt, res, timer)
         return row
 
@@ -900,9 +930,10 @@ class LogHandler(LogHandlerBase):
         self._workflow_start_time = time.time()
         dryrun = " [DRY RUN]" if self.common_settings.dryrun else ""
         self._push_event("i", "info", f"[bold]workflow started[/]{dryrun}")
+        # Add to log pane BEFORE ensuring live so non-TTY (tests/CI) still prints it.
         self._add_log_line(Rule(Text(f"Workflow Started{dryrun}", style=f"bold {C_AMBER}"), style=C_AMBER))
-        if self._live is not None:
-            self._refresh()
+        self._ensure_live()
+        self._refresh()
 
     def _handle_run_info(self, record: LogRecord) -> None:
         per_rule: dict[str, int] = getattr(record, "per_rule_job_counts", {}) or {}
@@ -929,13 +960,16 @@ class LogHandler(LogHandlerBase):
         if cores is not None:
             self._cores = cores
         if nodes:
-            self._nodes = list(nodes)
+            try:
+                self._nodes = list(nodes)
+            except TypeError:
+                self._nodes = [str(nodes)]
         provided = getattr(record, "provided_resources", None)
         parts = []
         if cores is not None:
             parts.append(f"{cores} cores")
-        if nodes:
-            parts.append(f"nodes {', '.join(nodes)}")
+        if self._nodes:
+            parts.append(f"nodes {', '.join(self._nodes)}")
         if provided:
             parts.append(f"resources {provided}")
         if parts:
@@ -986,7 +1020,8 @@ class LogHandler(LogHandlerBase):
         )
         # Ensure the rule appears in the rules list even if run_info didn't list it.
         self._rule_stats.setdefault(rule_name, _RuleStats())
-        # Verbose mode: dump a detail table into scrollback.
+        # Verbose mode: dump a detail table. Do this BEFORE _ensure_live so that for
+        # the very first job the Panel falls back to direct console output (pre-TUI).
         if self.common_settings.verbose:
             header = Text()
             header.append(f"Job {jobid}  ", style=f"bold {C_AMBER}")
@@ -1013,6 +1048,9 @@ class LogHandler(LogHandlerBase):
                                          title=header, border_style=C_AMBER))
             else:
                 self._add_log_line(Panel(table, title=header, border_style=C_AMBER))
+        # Start the TUI now so cluster jobs show as "submitted" even if JOB_STARTED
+        # never fires (e.g. Slurm executor doesn't always emit it).
+        self._ensure_live()
         if self._live is not None:
             self._refresh()
 
@@ -1030,7 +1068,9 @@ class LogHandler(LogHandlerBase):
 
     def _handle_job_finished(self, record: LogRecord) -> None:
         job_id: int = getattr(record, "job_id", getattr(record, "jobid", -1))
-        je = self._active_jobs.pop(job_id, None)
+        # For cluster executors (e.g. Slurm), jobs may complete without passing
+        # through _active_jobs if JOB_STARTED was never emitted — check _job_specs too.
+        je = self._active_jobs.pop(job_id, None) or self._job_specs.pop(job_id, None)
         if je is not None:
             self._bump_rule(je.rule, running_delta=-1, done_delta=1)
             dur = _mono_elapsed(time.time() - je.started_at)
@@ -1044,7 +1084,7 @@ class LogHandler(LogHandlerBase):
 
     def _handle_job_error(self, record: LogRecord) -> None:
         jobid: int = getattr(record, "jobid", -1)
-        je = self._active_jobs.pop(jobid, None)
+        je = self._active_jobs.pop(jobid, None) or self._job_specs.pop(jobid, None)
         if je is not None:
             self._bump_rule(je.rule, running_delta=-1, failed_delta=1)
             self._push_event("✗", "err", f"job [bold]#{jobid}[/] [bold {C_ROSE}]failed[/] · [{C_AMBER}]{je.rule}[/]")
@@ -1152,13 +1192,17 @@ class LogHandler(LogHandlerBase):
             body.append(f"{self._jobs_failed} job(s) failed", style=f"bold {C_ROSE}")
             body.append(", ", style=C_INK_DIM)
             body.append(f"{self._jobs_done} completed{elapsed_str}", style=C_INK_SOFT)
-            self._print_above(Panel(body, title=Text("Workflow Failed", style=f"bold {C_ROSE}"),
-                                    border_style=C_ROSE))
+            summary = Panel(body, title=Text("Workflow Failed", style=f"bold {C_ROSE}"),
+                            border_style=C_ROSE)
         else:
             body = Text()
             body.append(f"{self._jobs_done} job(s) completed{elapsed_str}", style=f"bold {C_LEAF}")
-            self._print_above(Panel(body, title=Text("Workflow Complete", style=f"bold {C_LEAF}"),
-                                    border_style=C_LEAF))
+            summary = Panel(body, title=Text("Workflow Complete", style=f"bold {C_LEAF}"),
+                            border_style=C_LEAF)
+        # In TTY/TUI mode: summary is already visible in the final TUI frame (_render_summary).
+        # Only print to the terminal in non-TTY mode (CI, pipes) for log file capture.
+        if not self.console.is_terminal:
+            self._print_above(summary)
         # Reset counters so a subsequent run in the same process starts clean.
         self._jobs_done = 0
         self._jobs_failed = 0
