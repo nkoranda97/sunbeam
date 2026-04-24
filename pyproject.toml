@@ -1,0 +1,10 @@
+[project]
+name = "sunbeam"
+version = "0.1.0"
+description = "A beautiful and informative logger for snakemake"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "rich>=15.0.0",
+    "snakemake-interface-logger-plugins>=2.0.1",
+]
