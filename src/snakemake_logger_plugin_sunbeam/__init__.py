@@ -930,10 +930,13 @@ class LogHandler(LogHandlerBase):
         self._workflow_start_time = time.time()
         dryrun = " [DRY RUN]" if self.common_settings.dryrun else ""
         self._push_event("i", "info", f"[bold]workflow started[/]{dryrun}")
-        # Add to log pane BEFORE ensuring live so non-TTY (tests/CI) still prints it.
         self._add_log_line(Rule(Text(f"Workflow Started{dryrun}", style=f"bold {C_AMBER}"), style=C_AMBER))
-        self._ensure_live()
-        self._refresh()
+        # Do NOT start the TUI here — WORKFLOW_STARTED fires before DAG validation and
+        # resource checks. Starting the alternate screen this early swallows Snakemake's
+        # own stderr output and can cause silent failures. The TUI starts on the first
+        # JOB_INFO event, after Snakemake is ready to actually run jobs.
+        if self._live is not None:
+            self._refresh()
 
     def _handle_run_info(self, record: LogRecord) -> None:
         per_rule: dict[str, int] = getattr(record, "per_rule_job_counts", {}) or {}
