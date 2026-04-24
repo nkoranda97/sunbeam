@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import re
 import select
@@ -134,26 +135,21 @@ def _sparkline(values: list[float], width: int = 24) -> Text:
 
 
 def _progress_bar_markup(done: int, running: int, failed: int, total: int, width: int = 48) -> Text:
-    """Solid progress bar: green (done) + amber (running) + rose (failed) + dim (pending)."""
+    """Solid progress bar: amber (done) + gold (running) + rose (failed). No pending segment."""
     total = max(total, 1)
-    # Number of cells allocated to each slice; use stable rounding.
     done_cells = round(done / total * width)
     fail_cells = round(failed / total * width)
     run_cells  = round(running / total * width)
-    # Clamp so we never exceed width.
     used = done_cells + fail_cells + run_cells
     if used > width:
-        # Trim running first, then failed.
         overflow = used - width
         trim = min(overflow, run_cells);  run_cells  -= trim; overflow -= trim
         trim = min(overflow, fail_cells); fail_cells -= trim; overflow -= trim
         done_cells -= overflow
-    pending = width - done_cells - fail_cells - run_cells
     bar = Text()
     bar.append("█" * done_cells, style=C_AMBER)
     bar.append("█" * run_cells,  style=C_GOLD)
     bar.append("█" * fail_cells, style=C_ROSE)
-    bar.append("░" * pending,    style=C_INK_FAINT)
     return bar
 
 
@@ -235,6 +231,10 @@ class LogHandler(LogHandlerBase):
 
         # In-frame log pane (Rich renderables replacing _print_above in fullscreen mode)
         self._log_lines: Deque[Any] = deque(maxlen=20)
+
+        # Scroll state (viewport into the rendered panel)
+        self._scroll_offset: int = 999999  # clamped to max on first render → starts at bottom
+        self._scroll_max: int = 0
 
         # Last shell command (rule, cmd, job ref)
         self._last_shell: Optional[tuple[str, str, str]] = None
@@ -321,9 +321,9 @@ class LogHandler(LogHandlerBase):
         if self._live is not None:
             return
         self._live = Live(
-            self._render_frame(),
+            get_renderable=self._render_frame,  # called each tick → spinner animates
             console=self.console,
-            screen=True,                # fullscreen alternate-screen buffer
+            screen=True,                        # fullscreen alternate-screen buffer
             refresh_per_second=8,
             transient=False,
             redirect_stdout=False,
@@ -345,11 +345,11 @@ class LogHandler(LogHandlerBase):
         self._start_keyboard_thread()
 
     def _refresh(self) -> None:
-        """Re-render the frame with current state."""
+        """Trigger an immediate re-render (get_renderable calls _render_frame each tick)."""
         if self._live is None:
             return
         self._sample_throughput()
-        self._live.update(self._render_frame())
+        self._live.refresh()
 
     def _stop_live(self) -> None:
         # Stop keyboard thread before TTY restore to avoid a race.
@@ -429,6 +429,14 @@ class LogHandler(LogHandlerBase):
                 elif ch == "/":
                     self._filter_active = True
                     self._filter_text = ""
+                elif ch == "j":
+                    self._scroll_offset = min(self._scroll_offset + 3, 999999)
+                elif ch == "k":
+                    self._scroll_offset = max(0, self._scroll_offset - 3)
+                elif ch == "g":
+                    self._scroll_offset = 0
+                elif ch == "G":
+                    self._scroll_offset = 999999
         self._refresh()
 
     # ─── log pane ────────────────────────────────────────────────────
@@ -490,7 +498,7 @@ class LogHandler(LogHandlerBase):
 
     # ─── frame rendering ──────────────────────────────────────────────
 
-    def _render_frame(self) -> Panel:
+    def _build_panel(self) -> Panel:
         body = Group(
             self._render_banner(),
             Text(""),
@@ -511,6 +519,46 @@ class LogHandler(LogHandlerBase):
             padding=(0, 0),
             box=box.ROUNDED,
         )
+
+    def _render_frame(self) -> Any:
+        """Called by Live's get_renderable on every tick.
+
+        Renders the full panel into an ANSI buffer, slices the visible window
+        based on _scroll_offset, and returns the cropped view as a Text object.
+        Starts pinned to the bottom so the status bar (keybindings) is always
+        visible; j/k scroll through the content.
+        """
+        panel = self._build_panel()
+        try:
+            h = self.console.size.height
+            w = self._get_width()
+        except Exception:
+            return panel
+        if h <= 0:
+            return panel
+
+        buf_file = io.StringIO()
+        buf = Console(
+            file=buf_file,
+            width=w,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=self.console.no_color,
+            highlight=False,
+        )
+        buf.print(panel)
+        ansi = buf_file.getvalue()
+
+        all_lines = ansi.split("\n")
+        if all_lines and not all_lines[-1]:
+            all_lines = all_lines[:-1]
+
+        total = len(all_lines)
+        self._scroll_max = max(0, total - h)
+        self._scroll_offset = max(0, min(self._scroll_offset, self._scroll_max))
+
+        visible = all_lines[self._scroll_offset:self._scroll_offset + h]
+        return Text.from_ansi("\n".join(visible))
 
     def _get_width(self) -> int:
         try:
@@ -563,6 +611,8 @@ class LogHandler(LogHandlerBase):
             filter_text = self._filter_text
             verbose_on = self._verbose_override
             quit_pending = self._quit_pending
+        scroll_offset = self._scroll_offset
+        scroll_max = self._scroll_max
         right = Text()
         if quit_pending:
             right.append(" QUIT? ", style=f"bold {C_INK} on {C_ROSE}")
@@ -576,10 +626,16 @@ class LogHandler(LogHandlerBase):
             right.append("█", style=C_AMBER)
             right.append("  ESC clear  ", style=C_INK_FAINT)
         else:
-            for k, v in (("q", "quit"), ("v", "verbose"), ("/", "filter")):
+            for k, v in (("q", "quit"), ("v", "verbose"), ("/", "filter"), ("k", "▲"), ("j", "▼")):
                 k_style = f"bold {C_AMBER} on {C_LINE}" if (k == "v" and verbose_on) else f"{C_INK_SOFT} on {C_LINE}"
                 right.append(f" {k} ", style=k_style)
                 right.append(f" {v}  ", style=C_INK_FAINT)
+        # Scroll position indicator on the left when not at the bottom.
+        if scroll_max > 0:
+            pct = int((scroll_offset / scroll_max) * 100) if scroll_max else 100
+            indicator_style = C_SKY if scroll_offset > 0 else C_INK_FAINT
+            left.append("   ", style=C_INK_FAINT)
+            left.append(f"↕ {pct}%", style=indicator_style)
         t.add_row(Padding(left, (0, 1)), Padding(right, (0, 1)))
         return t
 
