@@ -274,6 +274,7 @@ class LogHandler(LogHandlerBase):
     def emit(self, record: LogRecord) -> None:
         try:
             event = getattr(record, "event", None)
+            self._debug_event(event, record)
             handler = self._dispatch.get(event)
             if handler is not None:
                 handler(record)
@@ -284,6 +285,24 @@ class LogHandler(LogHandlerBase):
                     self._add_log_line(Text(msg, style=C_INK_SOFT))
         except Exception:
             self.handleError(record)
+
+    def _debug_event(self, event: Any, record: LogRecord) -> None:
+        """Write every event + its custom attributes to /tmp/sunbeam_debug.log.
+
+        Only active when the SUNBEAM_DEBUG environment variable is set.
+        Remove this method (and its call in emit) once the cluster event
+        names and attributes are confirmed.
+        """
+        if not os.environ.get("SUNBEAM_DEBUG"):
+            return
+        try:
+            skip = frozenset(vars(LogRecord("", 0, "", 0, "", (), None)))
+            extras = {k: repr(v) for k, v in vars(record).items() if k not in skip}
+            line = f"EVENT={event!r}  {extras}\n"
+            with open("/tmp/sunbeam_debug.log", "a") as f:
+                f.write(line)
+        except Exception:
+            pass
 
     def close(self) -> None:
         # If we never showed the summary (e.g. interrupted), print it now.
