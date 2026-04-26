@@ -151,6 +151,10 @@ class TestSunbeamLogHandler(TestLogHandlerBase):
         handler.emit(make_record(LogEvent.PROGRESS, done=3, total=10))
         assert handler._live is not None
         handler.emit(make_record(LogEvent.PROGRESS, done=10, total=10))
+        # TUI stays open after completion; user must call close() to dismiss.
+        assert handler._finished is True
+        assert handler._live is not None
+        handler.close()
         assert handler._live is None
 
     def test_emit_never_raises_on_bad_record(self):
@@ -186,6 +190,8 @@ class TestSunbeamLogHandler(TestLogHandlerBase):
         handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=1))
         handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=2))
         handler.emit(make_record(LogEvent.PROGRESS, done=2, total=2))
+        # Summary is printed when close() flushes (non-TTY path).
+        handler.close()
         output = console.export_text(clear=False)
         assert "Workflow Complete" in output
         assert "2" in output
@@ -195,6 +201,7 @@ class TestSunbeamLogHandler(TestLogHandlerBase):
         handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=1))
         handler.emit(make_record(LogEvent.JOB_ERROR, jobid=2))
         handler.emit(make_record(LogEvent.PROGRESS, done=2, total=2))
+        handler.close()
         output = console.export_text(clear=False)
         assert "Workflow Failed" in output
 
@@ -294,6 +301,8 @@ class TestSunbeamLogHandler(TestLogHandlerBase):
         handler.emit(make_record(LogEvent.PROGRESS, done=0, total=5))
         assert handler._live is not None
         handler.emit(make_record(LogEvent.PROGRESS, done=5, total=5))
+        assert handler._finished is True
+        handler.close()
         assert handler._live is None
         assert "Workflow Complete" in console.export_text(clear=False)
 

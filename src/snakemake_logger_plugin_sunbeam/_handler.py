@@ -88,6 +88,7 @@ class LogHandler(LogHandlerBase):
         self._filter_active: bool = False      # True while '/' mode is on
         self._filter_text: str = ""            # characters accumulated after '/'
         self._quit_pending: bool = False       # True after first 'q', waiting for confirm
+        self._user_quit_event: threading.Event = threading.Event()
 
         # Run state
         self._workflow_name: str = "workflow"
@@ -172,12 +173,12 @@ class LogHandler(LogHandlerBase):
             self.handleError(record)
 
     def close(self) -> None:
-        # If we never showed the summary (e.g. interrupted), print it now.
-        if self._workflow_start_time is not None and not self._finished:
-            self._stop_live()
+        if self._finished and self.console.is_terminal and self._live is not None:
+            # Workflow complete in TUI mode — hold the summary screen until user quits.
+            self._user_quit_event.wait()
+        self._stop_live()
+        if self._workflow_start_time is not None or self._finished:
             self._print_workflow_summary()
-        else:
-            self._stop_live()
         super().close()
 
     # ─── Live plumbing ────────────────────────────────────────────────
@@ -267,9 +268,15 @@ class LogHandler(LogHandlerBase):
                         self._on_key(ch)
             except (OSError, ValueError):
                 break
+        # Unblock close() if the terminal closed before the user pressed q.
+        self._user_quit_event.set()
 
     def _on_key(self, ch: str) -> None:
         with self._kb_lock:
+            if self._finished:
+                if ch in ("q", "Q"):
+                    self._user_quit_event.set()
+                return
             if self._filter_active:
                 if ch == "\x1b":                        # ESC — clear filter
                     self._filter_active = False
@@ -487,7 +494,10 @@ class LogHandler(LogHandlerBase):
         scroll_offset = self._scroll_offset
         scroll_max = self._scroll_max
         right = Text()
-        if quit_pending:
+        if self._finished:
+            right.append(" q ", style=f"{C_INK_SOFT} on {C_LINE}")
+            right.append(" exit  ", style=C_INK_FAINT)
+        elif quit_pending:
             right.append(" QUIT? ", style=f"bold {C_INK} on {C_ROSE}")
             right.append("  q  ", style=f"bold {C_ROSE} on {C_LINE}")
             right.append(" confirm  ", style=C_ROSE)
@@ -1154,8 +1164,6 @@ class LogHandler(LogHandlerBase):
             self._finished = True
             if self._live is not None:
                 self._refresh()
-            self._stop_live()
-            self._print_workflow_summary()
 
     def _handle_error(self, record: LogRecord) -> None:
         exception = getattr(record, "exception", None)
