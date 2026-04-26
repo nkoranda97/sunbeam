@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(uv --directory /home/nkoranda/Projects/sunbeam run python -c \"import rich; print\\(rich.__version__\\)\")",
-      "Bash(echo \"exit: $?\")",
-      "Bash(echo \"demo exit: $?\")"
-    ]
-  }
-}

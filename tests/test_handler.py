@@ -1,7 +1,6 @@
 import logging
 import time
 import uuid
-from typing import Type
 
 from rich.console import Console
 from snakemake_interface_logger_plugins.base import LogHandlerBase
@@ -49,7 +48,7 @@ def make_handler(
 class TestSunbeamLogHandler(TestLogHandlerBase):
     __test__ = True
 
-    def get_log_handler_cls(self) -> Type[LogHandlerBase]:
+    def get_log_handler_cls(self) -> type[LogHandlerBase]:
         return LogHandler
 
     def get_log_handler_settings(self) -> LogHandlerSettingsBase:
@@ -238,3 +237,161 @@ class TestSunbeamLogHandler(TestLogHandlerBase):
         handler, console = make_handler(debug_dag=True)
         handler.emit(make_record(LogEvent.DEBUG_DAG, status="ready", file="some.txt"))
         assert "DAG" in console.export_text(clear=False)
+
+    # ── new edge-case coverage ────────────────────────────────────────
+
+    def test_cluster_job_finish_without_start_no_negative_running(self):
+        """JOB_FINISHED for a job that came through JOB_INFO but not JOB_STARTED
+        must not produce a negative running count for the rule."""
+        from snakemake_logger_plugin_sunbeam import _RuleStats
+        handler, _ = make_handler()
+        handler.emit(make_record(
+            LogEvent.RUN_INFO, per_rule_job_counts={"align": 1}, total_job_count=1,
+        ))
+        handler.emit(make_record(LogEvent.JOB_INFO, jobid=7, rule_name="align", threads=1))
+        # Job goes straight to FINISHED without JOB_STARTED (cluster pattern).
+        handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=7))
+        stats: _RuleStats = handler._rule_stats["align"]
+        assert stats.running >= 0, f"running went negative: {stats.running}"
+        assert stats.done == 1
+
+    def test_cluster_job_error_without_start_no_negative_running(self):
+        """JOB_ERROR for a job that skipped JOB_STARTED must not produce negative running."""
+        from snakemake_logger_plugin_sunbeam import _RuleStats
+        handler, _ = make_handler()
+        handler.emit(make_record(
+            LogEvent.RUN_INFO, per_rule_job_counts={"align": 1}, total_job_count=1,
+        ))
+        handler.emit(make_record(LogEvent.JOB_INFO, jobid=8, rule_name="align", threads=1))
+        handler.emit(make_record(LogEvent.JOB_ERROR, jobid=8))
+        stats: _RuleStats = handler._rule_stats["align"]
+        assert stats.running >= 0, f"running went negative: {stats.running}"
+        assert stats.failed == 1
+
+    def test_duplicate_job_finished_is_safe(self):
+        """A second JOB_FINISHED for the same job_id must not crash or double-count."""
+        handler, _ = make_handler()
+        handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=99))
+        done_after_first = handler._jobs_done
+        handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=99))
+        assert handler._jobs_done == done_after_first + 1  # second event still counts once
+
+    def test_job_finished_unknown_id_is_safe(self):
+        """JOB_FINISHED for an ID never seen must not crash."""
+        handler, _ = make_handler()
+        handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=9999))
+        assert handler._jobs_done == 1
+
+    def test_job_error_unknown_id_is_safe(self):
+        """JOB_ERROR for an ID never seen must not crash."""
+        handler, _ = make_handler()
+        handler.emit(make_record(LogEvent.JOB_ERROR, jobid=9999))
+        assert handler._jobs_failed == 1
+
+    def test_progress_only_run_no_job_events(self):
+        """PROGRESS events alone (no JOB_INFO/JOB_STARTED) must complete lifecycle."""
+        handler, console = make_handler()
+        handler.emit(make_record(LogEvent.PROGRESS, done=0, total=5))
+        assert handler._live is not None
+        handler.emit(make_record(LogEvent.PROGRESS, done=5, total=5))
+        assert handler._live is None
+        assert "Workflow Complete" in console.export_text(clear=False)
+
+    def test_slurm_submission_message_updates_rule(self):
+        """Slurm submission log messages back-fill rule/wildcard for already-active jobs."""
+        from snakemake_logger_plugin_sunbeam import _JobEntry, _RuleStats
+        handler, _ = make_handler()
+        # Simulate a job that somehow reached _active_jobs (e.g. via JOB_STARTED).
+        placeholder = _JobEntry(job_id=22, rule="job_22")
+        handler._active_jobs[22] = placeholder
+        handler._rule_stats["job_22"] = _RuleStats(running=1)
+        slurm_msg = (
+            "Job 22 has been submitted with SLURM jobid 48989767 "
+            "(log: /scratch/.snakemake/slurm_logs/rule_align_pe/TEAD1-2/48989767.log)."
+        )
+        record = logging.LogRecord("snakemake", logging.INFO, "f.py", 1, slurm_msg, (), None)
+        handler.emit(record)
+        assert handler._active_jobs[22].rule == "align_pe"
+        assert handler._active_jobs[22].wildcards_str == "TEAD1-2"
+
+    def test_slurm_submission_message_moves_job_to_active(self):
+        """Real SLURM flow: JOB_INFO puts job in _job_specs; submission message moves it to
+        _active_jobs with correct rule/wildcard and increments running count."""
+        from snakemake_logger_plugin_sunbeam import _RuleStats
+        handler, _ = make_handler()
+        handler.emit(make_record(
+            LogEvent.RUN_INFO, per_rule_job_counts={"align_pe": 1}, total_job_count=1,
+        ))
+        # JOB_INFO puts job in _job_specs, not _active_jobs.
+        handler.emit(make_record(LogEvent.JOB_INFO, jobid=22, rule_name="align_pe", threads=4))
+        assert 22 in handler._job_specs
+        assert 22 not in handler._active_jobs
+        slurm_msg = (
+            "Job 22 has been submitted with SLURM jobid 48989767 "
+            "(log: /scratch/.snakemake/slurm_logs/rule_align_pe/TEAD1-2/48989767.log)."
+        )
+        record = logging.LogRecord("snakemake", logging.INFO, "f.py", 1, slurm_msg, (), None)
+        handler.emit(record)
+        # Job must have moved to _active_jobs with correct metadata.
+        assert 22 not in handler._job_specs
+        assert 22 in handler._active_jobs
+        je = handler._active_jobs[22]
+        assert je.rule == "align_pe"
+        assert je.wildcards_str == "TEAD1-2"
+        # Running count must be positive.
+        stats: _RuleStats = handler._rule_stats["align_pe"]
+        assert stats.running == 1
+
+    def test_slurm_chip_not_idle_after_job_info(self):
+        """The status chip must not show IDLE once JOB_INFO fires, even if
+        WORKFLOW_STARTED was never emitted."""
+        handler, _ = make_handler()
+        # Do NOT emit WORKFLOW_STARTED — simulate a missed event.
+        assert handler._workflow_start_time is None
+        handler.emit(make_record(LogEvent.JOB_INFO, jobid=1, rule_name="align", threads=1))
+        assert handler._workflow_start_time is not None
+
+    def test_non_tty_live_is_not_fullscreen(self):
+        """On a non-TTY console, Live must not request the alternate screen buffer."""
+        handler, _ = make_handler()
+        # handler.console is the recording Console from make_handler; it is NOT a terminal.
+        assert not handler.console.is_terminal
+        handler.emit(make_record(LogEvent.PROGRESS, done=0, total=3))
+        assert handler._live is not None
+        assert not handler._live._screen
+        handler._stop_live()
+
+    def test_quiet_suppresses_shellcmd_event(self):
+        """Shell command events for quiet rules must be suppressed."""
+        handler, _ = make_handler(quiet=["boring"])
+        handler.emit(make_record(LogEvent.SHELLCMD, shellcmd="echo hi", rule_name="boring"))
+        assert handler._last_shell is None
+
+    def test_quiet_suppresses_job_started_event(self):
+        """JOB_STARTED for quiet rules must not push to the events ring."""
+        handler, _ = make_handler(quiet=["boring"])
+        handler.emit(make_record(
+            LogEvent.JOB_INFO, jobid=1, rule_name="boring", threads=1,
+        ))
+        handler.emit(make_record(LogEvent.JOB_STARTED, job_ids=[1]))
+        assert not any("boring" in e.markup for e in handler._events)
+
+    def test_quiet_suppresses_job_finished_event(self):
+        """JOB_FINISHED for quiet rules must not push to the events ring."""
+        from snakemake_logger_plugin_sunbeam import _JobEntry
+        handler, _ = make_handler(quiet=["boring"])
+        handler._active_jobs[3] = _JobEntry(job_id=3, rule="boring")
+        handler.emit(make_record(LogEvent.JOB_FINISHED, job_id=3))
+        assert not any("boring" in e.markup for e in handler._events)
+
+    def test_stop_live_is_idempotent(self):
+        """Calling _stop_live twice must not raise."""
+        handler, _ = make_handler()
+        handler._ensure_live()
+        handler._stop_live()
+        handler._stop_live()  # second call must be a no-op
+
+    def test_close_without_live_is_safe(self):
+        """close() before any events must not raise."""
+        handler, _ = make_handler()
+        handler.close()

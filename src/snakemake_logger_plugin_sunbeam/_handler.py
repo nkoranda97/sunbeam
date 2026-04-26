@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import io
 import os
+import re
+import select
+import signal
 import sys
+import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from collections.abc import Callable
 from logging import LogRecord
 from pathlib import Path
-from typing import Any, Callable, Deque, Optional
+from typing import Any
 
 try:
     import termios
@@ -26,159 +31,40 @@ from rich.table import Table
 from rich.text import Text
 from snakemake_interface_logger_plugins.base import LogHandlerBase
 from snakemake_interface_logger_plugins.common import LogEvent
-from snakemake_interface_logger_plugins.settings import (
-    LogHandlerSettingsBase,
-    OutputSettingsLoggerInterface,
+from snakemake_interface_logger_plugins.settings import OutputSettingsLoggerInterface
+
+from .rendering import (
+    _mono_elapsed,
+    _progress_bar_markup,
+    _rule_bar_markup,
+    _sparkline,
+    _spinner_frame,
 )
+from .settings import (
+    C_AMBER,
+    C_BG_ON_AMBER,
+    C_INK,
+    C_INK_DIM,
+    C_INK_FAINT,
+    C_INK_SOFT,
+    C_LEAF,
+    C_LINE,
+    C_ROSE,
+    C_SKY,
+    EVENT_RING_SIZE,
+    HERO_STATS,
+    SPARK_HISTORY_SIZE,
+    SPARK_WINDOW_SECS,
+    LogHandlerSettings,
+)
+from .state import _EventEntry, _JobEntry, _RuleStats
 
-
-# ────────────────────────────── palette ──────────────────────────────
-C_AMBER       = "#f5a524"   # primary accent
-C_AMBER_SOFT  = "#c97a14"
-C_GOLD        = "#ffd166"
-C_EMBER       = "#e8703a"
-C_ROSE        = "#e05a4a"   # failures
-C_SAGE        = "#8fb07a"   # success
-C_LEAF        = "#a3c76d"
-C_SKY         = "#78b5c9"   # info events
-C_VIOLET      = "#a88fbf"
-
-C_INK         = "#f4e6cd"   # primary text
-C_INK_SOFT    = "#c9b893"
-C_INK_DIM     = "#8a7a5d"
-C_INK_FAINT   = "#5a4e3a"
-
-C_LINE        = "#3a2f22"
-C_BG_ON_AMBER = "#1a1208"   # tmux badge fg
-
-# Max items in the bounded event ring and sparkline history.
-EVENT_RING_SIZE = 8
-SPARK_HISTORY_SIZE = 24        # throughput samples (one per refresh tick)
-SPARK_WINDOW_SECS = 60         # samples used for peak/current throughput
-
-# Unicode block chars for the sparkline, low → high.
-SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
-
-# Hero stat column order and default widths.
-HERO_STATS = ("total", "done", "running", "queued", "failed", "cores")
-
-
-# ───────────────────────────── settings ──────────────────────────────
-
-@dataclass
-class LogHandlerSettings(LogHandlerSettingsBase):
-    theme: Optional[str] = field(
-        default=None,
-        metadata={"help": "Pygments theme for syntax-highlighted shell/python blocks.", "type": str},
-    )
-
-
-# ────────────────────────── internal state ───────────────────────────
-
-@dataclass
-class _JobEntry:
-    job_id: int
-    rule: str
-    wildcards_str: str = ""
-    threads: int = 1
-    resources_str: str = ""
-    started_at: float = field(default_factory=time.time)
-    state: str = "running"   # running | done | fail | queued
-
-
-@dataclass
-class _RuleStats:
-    total: int = 0
-    done: int = 0
-    running: int = 0
-    failed: int = 0
-
-
-@dataclass
-class _EventEntry:
-    t: str          # "HH:MM"
-    glyph: str      # "▸" "✓" "✗" "!" "i"
-    kind: str       # info | ok | warn | err
-    markup: str     # rich markup
-
-
-# ────────────────────── custom renderable pieces ─────────────────────
-
-def _mono_elapsed(secs: float) -> str:
-    m, s = divmod(int(secs), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def _sparkline(values: list[float], width: int = 24) -> Text:
-    """Unicode block sparkline. Returns Text; empty if no data."""
-    if not values:
-        return Text("")
-    # Use the last `width` samples; pad left with zeros.
-    tail = values[-width:]
-    if len(tail) < width:
-        tail = [0.0] * (width - len(tail)) + tail
-    peak = max(tail) or 1.0
-    chars = []
-    for v in tail:
-        if v <= 0:
-            idx = 0
-        else:
-            idx = min(len(SPARK_BLOCKS) - 1, int((v / peak) * (len(SPARK_BLOCKS) - 1)) + 1)
-        chars.append(SPARK_BLOCKS[idx])
-    return Text("".join(chars), style=C_AMBER)
-
-
-def _progress_bar_markup(done: int, running: int, failed: int, total: int, width: int = 48) -> Text:
-    """Solid progress bar: green (done) + amber (running) + rose (failed) + dim (pending)."""
-    total = max(total, 1)
-    # Number of cells allocated to each slice; use stable rounding.
-    done_cells = round(done / total * width)
-    fail_cells = round(failed / total * width)
-    run_cells  = round(running / total * width)
-    # Clamp so we never exceed width.
-    used = done_cells + fail_cells + run_cells
-    if used > width:
-        # Trim running first, then failed.
-        overflow = used - width
-        trim = min(overflow, run_cells);  run_cells  -= trim; overflow -= trim
-        trim = min(overflow, fail_cells); fail_cells -= trim; overflow -= trim
-        done_cells -= overflow
-    pending = width - done_cells - fail_cells - run_cells
-    bar = Text()
-    bar.append("█" * done_cells, style=C_AMBER)
-    bar.append("█" * run_cells,  style=C_GOLD)
-    bar.append("█" * fail_cells, style=C_ROSE)
-    bar.append("░" * pending,    style=C_INK_FAINT)
-    return bar
-
-
-def _rule_bar_markup(done: int, running: int, failed: int, total: int, width: int = 14) -> Text:
-    """Compact per-rule progress bar."""
-    return _progress_bar_markup(done, running, failed, total, width=width)
-
-
-def _spinner_frame() -> str:
-    """Pick a braille spinner frame from wall-clock time.
-
-    We used ``rich.spinner.Spinner`` before, but each Spinner instance mutates
-    its own frame counter tied to Live refresh cadence. Since our Live redraws
-    only when state changes, that made spinners stutter. Deriving the frame
-    from ``time.time()`` means all running jobs animate in lockstep regardless
-    of how often Live refreshes.
-    """
-    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    idx = int(time.time() * 10) % len(frames)
-    return frames[idx]
-
-
-# ─────────────────────────── main handler ────────────────────────────
 
 class LogHandler(LogHandlerBase):
     def __init__(
         self,
         common_settings: OutputSettingsLoggerInterface,
-        settings: Optional[LogHandlerSettings] = None,
+        settings: LogHandlerSettings | None = None,
     ) -> None:
         super().__init__(common_settings=common_settings, settings=settings)
 
@@ -191,14 +77,23 @@ class LogHandler(LogHandlerBase):
         )
 
         # Live frame + tty state
-        self._live: Optional[Live] = None
-        self._old_tty_settings: Optional[list] = None
+        self._live: Live | None = None
+        self._old_tty_settings: list | None = None
+
+        # Keyboard / TUI interaction state
+        self._kb_lock: threading.Lock = threading.Lock()
+        self._kb_thread: threading.Thread | None = None
+        self._kb_running: bool = False
+        self._verbose_override: bool = False   # toggled by 'v' key
+        self._filter_active: bool = False      # True while '/' mode is on
+        self._filter_text: str = ""            # characters accumulated after '/'
+        self._quit_pending: bool = False       # True after first 'q', waiting for confirm
 
         # Run state
         self._workflow_name: str = "workflow"
-        self._snakefile: Optional[str] = None
-        self._workflow_id: Optional[str] = None
-        self._workflow_start_time: Optional[float] = None
+        self._snakefile: str | None = None
+        self._workflow_id: str | None = None
+        self._workflow_start_time: float | None = None
 
         # Job tracking
         self._active_jobs: dict[int, _JobEntry] = {}
@@ -209,19 +104,26 @@ class LogHandler(LogHandlerBase):
         self._jobs_failed: int = 0
 
         # Resources
-        self._cores: Optional[int] = None
+        self._cores: int | None = None
         self._nodes: list[str] = []
 
         # Throughput sparkline (completed-per-minute, sampled by refresh tick)
-        self._completion_times: Deque[float] = deque(maxlen=512)
-        self._spark_history: Deque[float] = deque(maxlen=SPARK_HISTORY_SIZE)
+        self._completion_times: deque[float] = deque(maxlen=512)
+        self._spark_history: deque[float] = deque(maxlen=SPARK_HISTORY_SIZE)
         self._last_spark_sample: float = 0.0
 
         # Events ring
-        self._events: Deque[_EventEntry] = deque(maxlen=EVENT_RING_SIZE)
+        self._events: deque[_EventEntry] = deque(maxlen=EVENT_RING_SIZE)
+
+        # In-frame log pane (Rich renderables replacing _print_above in fullscreen mode)
+        self._log_lines: deque[Any] = deque(maxlen=20)
+
+        # Scroll state (viewport into the rendered panel)
+        self._scroll_offset: int = 999999  # clamped to max on first render → starts at bottom
+        self._scroll_max: int = 0
 
         # Last shell command (rule, cmd, job ref)
-        self._last_shell: Optional[tuple[str, str, str]] = None
+        self._last_shell: tuple[str, str, str] | None = None
 
         # Syntax theme
         self._syntax_theme: str = (
@@ -231,7 +133,7 @@ class LogHandler(LogHandlerBase):
         )
 
         # ETA smoothing
-        self._eta_secs: Optional[float] = None
+        self._eta_secs: float | None = None
 
         # Summary flag — once the workflow ends, we freeze the frame.
         self._finished: bool = False
@@ -249,7 +151,6 @@ class LogHandler(LogHandlerBase):
             LogEvent.RESOURCES_INFO:   self._handle_resources_info,
             LogEvent.DEBUG_DAG:        self._handle_debug_dag,
             LogEvent.PROGRESS:         self._handle_progress,
-            LogEvent.RULEGRAPH:        self._handle_rulegraph,
             LogEvent.ERROR:            self._handle_error,
         }
 
@@ -262,10 +163,11 @@ class LogHandler(LogHandlerBase):
             if handler is not None:
                 handler(record)
             else:
-                # Unknown/uncategorized log — print above the frame.
                 msg = self.format(record)
                 if msg:
-                    self._print_above(Text(msg, style=C_INK_SOFT))
+                    # Parse Slurm submission messages to label active jobs with real rule names.
+                    self._maybe_update_job_from_slurm_msg(msg)
+                    self._add_log_line(Text(msg, style=C_INK_SOFT))
         except Exception:
             self.handleError(record)
 
@@ -285,32 +187,39 @@ class LogHandler(LogHandlerBase):
         if self._live is not None:
             return
         self._live = Live(
-            self._render_frame(),
+            get_renderable=self._render_frame,  # called each tick → spinner animates
             console=self.console,
+            screen=self.console.is_terminal,    # fullscreen only for real TTYs
             refresh_per_second=8,
             transient=False,
             redirect_stdout=False,
             redirect_stderr=False,
         )
         self._live.start()
-        # Suppress keyboard echo while Live owns the screen (matches old behaviour).
+        # Put stdin into raw mode: suppress echo AND line-buffering so we can
+        # read single keypresses without waiting for Enter.
         if _HAS_TERMIOS and sys.stdin.isatty():
             try:
                 self._old_tty_settings = termios.tcgetattr(sys.stdin)
                 new = termios.tcgetattr(sys.stdin)
-                new[3] &= ~termios.ECHO
+                new[3] &= ~(termios.ECHO | termios.ICANON)
+                new[6][termios.VMIN] = 1
+                new[6][termios.VTIME] = 0
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, new)
             except termios.error:
                 self._old_tty_settings = None
+        self._start_keyboard_thread()
 
     def _refresh(self) -> None:
-        """Re-render the frame with current state."""
+        """Trigger an immediate re-render."""
         if self._live is None:
             return
         self._sample_throughput()
-        self._live.update(self._render_frame())
+        self._live.refresh()
 
     def _stop_live(self) -> None:
+        # Stop keyboard thread before TTY restore to avoid a race.
+        self._stop_keyboard_thread()
         if self._live is not None:
             try:
                 self._live.stop()
@@ -331,6 +240,92 @@ class LogHandler(LogHandlerBase):
         else:
             self.console.print(renderable)
 
+    # ─── keyboard input thread ────────────────────────────────────────
+
+    def _start_keyboard_thread(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        self._kb_running = True
+        self._kb_thread = threading.Thread(
+            target=self._keyboard_reader, name="sunbeam-kb", daemon=True
+        )
+        self._kb_thread.start()
+
+    def _stop_keyboard_thread(self) -> None:
+        self._kb_running = False
+        if self._kb_thread is not None:
+            self._kb_thread.join(timeout=1.0)
+            self._kb_thread = None
+
+    def _keyboard_reader(self) -> None:
+        while self._kb_running:
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    ch = sys.stdin.read(1)
+                    if ch:
+                        self._on_key(ch)
+            except (OSError, ValueError):
+                break
+
+    def _on_key(self, ch: str) -> None:
+        with self._kb_lock:
+            if self._filter_active:
+                if ch == "\x1b":                        # ESC — clear filter
+                    self._filter_active = False
+                    self._filter_text = ""
+                elif ch in ("\x7f", "\x08"):            # Backspace / DEL
+                    self._filter_text = self._filter_text[:-1]
+                elif ch in ("\r", "\n"):                # Enter — commit
+                    self._filter_active = bool(self._filter_text)
+                elif ch.isprintable():
+                    self._filter_text += ch
+            elif self._quit_pending:
+                if ch in ("q", "Q"):                    # confirmed
+                    self._quit_pending = False
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+                else:                                   # any other key cancels
+                    self._quit_pending = False
+            else:
+                if ch in ("q", "Q"):
+                    self._quit_pending = True           # first press: arm confirmation
+                elif ch in ("v", "V"):
+                    self._verbose_override = not self._verbose_override
+                elif ch == "/":
+                    self._filter_active = True
+                    self._filter_text = ""
+                elif ch == "j":
+                    self._scroll_offset = min(self._scroll_offset + 3, 999999)
+                elif ch == "k":
+                    self._scroll_offset = max(0, self._scroll_offset - 3)
+                elif ch == "g":
+                    self._scroll_offset = 0
+                elif ch == "G":
+                    self._scroll_offset = 999999
+        self._refresh()
+
+    # ─── log pane ────────────────────────────────────────────────────
+
+    def _add_log_line(self, renderable: Any) -> None:
+        """Queue a Rich renderable into the in-frame log pane.
+
+        While the TUI is running: buffer into _log_lines (shown in the LOG pane).
+        Otherwise (pre-TUI, post-TUI, CI, tests): print directly to the console so
+        critical messages — including DAG errors before any jobs start — are never lost.
+        """
+        if self._live is not None and self._live.is_started:
+            self._log_lines.append(renderable)
+        else:
+            self.console.print(renderable)
+
+    def _render_log_pane(self) -> list[Any]:
+        if not self._log_lines:
+            return []
+        title = self._render_section_title("LOG")
+        items = list(self._log_lines)[-6:]
+        return [Text(""), title, *items]
+
     # ─── throughput sampling ──────────────────────────────────────────
 
     def _sample_throughput(self) -> None:
@@ -342,7 +337,6 @@ class LogHandler(LogHandlerBase):
         self._last_spark_sample = now
         cutoff = now - SPARK_WINDOW_SECS
         recent = sum(1 for t in self._completion_times if t >= cutoff)
-        # jobs per minute in the window
         rate = recent * (60.0 / SPARK_WINDOW_SECS)
         self._spark_history.append(rate)
 
@@ -352,7 +346,7 @@ class LogHandler(LogHandlerBase):
     def _peak_throughput(self) -> float:
         return max(self._spark_history) if self._spark_history else 0.0
 
-    def _compute_eta(self) -> Optional[float]:
+    def _compute_eta(self) -> float | None:
         """Exponential moving average on jobs/sec, smoothed against remaining."""
         if not self._workflow_start_time or self._total_jobs <= 0:
             return None
@@ -362,14 +356,14 @@ class LogHandler(LogHandlerBase):
         elapsed = time.time() - self._workflow_start_time
         if self._jobs_done <= 0 or elapsed <= 0:
             return None
-        rate = self._jobs_done / elapsed  # jobs / sec, averaged over the whole run
+        rate = self._jobs_done / elapsed
         if rate <= 0:
             return None
         return remaining / rate
 
     # ─── frame rendering ──────────────────────────────────────────────
 
-    def _render_frame(self) -> Panel:
+    def _build_panel(self) -> Panel:
         body = Group(
             self._render_banner(),
             Text(""),
@@ -379,6 +373,7 @@ class LogHandler(LogHandlerBase):
             self._render_sparkline_row(),
             Text(""),
             self._render_two_col(),
+            *self._render_log_pane(),
             *self._render_shell_block(),
             *self._render_summary(),
         )
@@ -389,6 +384,46 @@ class LogHandler(LogHandlerBase):
             padding=(0, 0),
             box=box.ROUNDED,
         )
+
+    def _render_frame(self) -> Any:
+        """Called by Live's get_renderable on every tick.
+
+        Renders the full panel into an ANSI buffer, slices the visible window
+        based on _scroll_offset, and returns the cropped view as a Text object.
+        Starts pinned to the bottom so the status bar (keybindings) is always
+        visible; j/k scroll through the content.
+        """
+        panel = self._build_panel()
+        try:
+            h = self.console.size.height
+            w = self._get_width()
+        except Exception:
+            return panel
+        if h <= 0:
+            return panel
+
+        buf_file = io.StringIO()
+        buf = Console(
+            file=buf_file,
+            width=w,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=self.console.no_color,
+            highlight=False,
+        )
+        buf.print(panel)
+        ansi = buf_file.getvalue()
+
+        all_lines = ansi.split("\n")
+        if all_lines and not all_lines[-1]:
+            all_lines = all_lines[:-1]
+
+        total = len(all_lines)
+        self._scroll_max = max(0, total - h)
+        self._scroll_offset = max(0, min(self._scroll_offset, self._scroll_max))
+
+        visible = all_lines[self._scroll_offset:self._scroll_offset + h]
+        return Text.from_ansi("\n".join(visible))
 
     def _get_width(self) -> int:
         try:
@@ -407,18 +442,23 @@ class LogHandler(LogHandlerBase):
         badge = Text(" SUNBEAM ", style=f"bold {C_BG_ON_AMBER} on {C_AMBER}")
         tabs = Text()
         tabs.append("  ")
-        tabs.append("0", style=f"bold {C_AMBER}"); tabs.append(":snakemake", style=C_INK)
+        tabs.append("0", style=f"bold {C_AMBER}")
+        tabs.append(":snakemake", style=C_INK)
         tabs.append("*", style=C_AMBER)
         tabs.append("   ")
-        tabs.append("1", style=C_INK_DIM); tabs.append(":editor", style=C_INK_FAINT)
+        tabs.append("1", style=C_INK_DIM)
+        tabs.append(":editor", style=C_INK_FAINT)
         tabs.append("   ")
-        tabs.append("2", style=C_INK_DIM); tabs.append(":shell", style=C_INK_FAINT)
+        tabs.append("2", style=C_INK_DIM)
+        tabs.append(":shell", style=C_INK_FAINT)
         meta = Text()
         host = os.uname().nodename if hasattr(os, "uname") else "local"
         py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-        meta.append(f"host ", style=C_INK_FAINT); meta.append(host, style=C_INK_SOFT)
+        meta.append("host ", style=C_INK_FAINT)
+        meta.append(host, style=C_INK_SOFT)
         meta.append("   ", style=C_INK_FAINT)
-        meta.append(f"py ",   style=C_INK_FAINT); meta.append(py, style=C_INK_SOFT)
+        meta.append("py ", style=C_INK_FAINT)
+        meta.append(py, style=C_INK_SOFT)
         meta.append("   ", style=C_INK_FAINT)
         meta.append(time.strftime("%H:%M"), style=C_INK)
         meta.append(" ", style=C_INK)
@@ -430,15 +470,45 @@ class LogHandler(LogHandlerBase):
         t.add_column(no_wrap=True)
         t.add_column(justify="right", no_wrap=True)
         left = Text()
-        left.append(" logger ", style=C_INK_FAINT); left.append("sunbeam", style=C_INK_SOFT)
+        left.append(" logger ", style=C_INK_FAINT)
+        left.append("sunbeam", style=C_INK_SOFT)
         left.append("   ", style=C_INK_FAINT)
-        left.append("theme ", style=C_INK_FAINT); left.append(self._syntax_theme, style=C_INK_SOFT)
+        left.append("theme ", style=C_INK_FAINT)
+        left.append(self._syntax_theme, style=C_INK_SOFT)
         left.append("   ", style=C_INK_FAINT)
-        left.append("cwd ",   style=C_INK_FAINT); left.append(self._short_cwd(), style=C_INK_SOFT)
+        left.append("cwd ", style=C_INK_FAINT)
+        left.append(self._short_cwd(), style=C_INK_SOFT)
+        # Snapshot interactive state under lock for this render pass.
+        with self._kb_lock:
+            filter_active = self._filter_active
+            filter_text = self._filter_text
+            verbose_on = self._verbose_override
+            quit_pending = self._quit_pending
+        scroll_offset = self._scroll_offset
+        scroll_max = self._scroll_max
         right = Text()
-        for k, v in (("q", "quit"), ("v", "verbose"), ("/", "filter")):
-            right.append(f" {k} ", style=f"{C_INK_SOFT} on {C_LINE}")
-            right.append(f" {v}  ", style=C_INK_FAINT)
+        if quit_pending:
+            right.append(" QUIT? ", style=f"bold {C_INK} on {C_ROSE}")
+            right.append("  q  ", style=f"bold {C_ROSE} on {C_LINE}")
+            right.append(" confirm  ", style=C_ROSE)
+            right.append(" ESC ", style=f"{C_INK_SOFT} on {C_LINE}")
+            right.append(" cancel  ", style=C_INK_FAINT)
+        elif filter_active:
+            right.append(" / ", style=f"bold {C_AMBER} on {C_LINE}")
+            right.append(f" {filter_text}", style=C_INK)
+            right.append("█", style=C_AMBER)
+            right.append("  ESC clear  ", style=C_INK_FAINT)
+        else:
+            for k, v in (("q", "quit"), ("v", "verbose"), ("/", "filter"), ("k", "▲"), ("j", "▼")):
+                k_style = f"bold {C_AMBER} on {C_LINE}" if (k == "v" and verbose_on) else f"{C_INK_SOFT} on {C_LINE}"
+                right.append(f" {k} ", style=k_style)
+                right.append(f" {v}  ", style=C_INK_FAINT)
+        # Scroll position indicator on the left when not at the bottom.
+        if scroll_max > 0:
+            pct = int((scroll_offset / scroll_max) * 100) if scroll_max else 100
+            indicator_style = C_SKY if scroll_offset > 0 else C_INK_FAINT
+            left.append("   ", style=C_INK_FAINT)
+            left.append(f"↕ {pct}%", style=indicator_style)
         t.add_row(Padding(left, (0, 1)), Padding(right, (0, 1)))
         return t
 
@@ -468,7 +538,8 @@ class LogHandler(LogHandlerBase):
         if self._snakefile:
             sub.append(self._short_path(self._snakefile) + "  ", style=C_INK_DIM)
         if self._workflow_id:
-            sub.append("id ", style=C_INK_FAINT); sub.append(self._workflow_id[:8], style=C_INK_SOFT)
+            sub.append("id ", style=C_INK_FAINT)
+            sub.append(self._workflow_id[:8], style=C_INK_SOFT)
         left_col = Group(title, sub) if sub.plain else title
         left.add_row(Padding(sun, (0, 1, 0, 1)), left_col)
 
@@ -512,7 +583,7 @@ class LogHandler(LogHandlerBase):
         running = len(self._active_jobs)
         queued = max(0, total - done - failed - running)
         pct = int((done / total) * 100) if total else 0
-        cores_txt = f"{self._cores}/32" if self._cores else "—"
+        cores_txt = str(self._cores) if self._cores else "—"
         data = {
             "total":   (Text("TOTAL",     style=C_INK_FAINT), Text(str(total),   style=f"bold {C_INK}")),
             "done":    (Text("COMPLETED", style=C_INK_FAINT), Text(f"{done}  {pct}%", style=f"bold {C_LEAF}")),
@@ -527,7 +598,6 @@ class LogHandler(LogHandlerBase):
             value_row.append(v)
         stats.add_row(*label_row)
         stats.add_row(*value_row)
-        # accent bar on the left of the total column
         return Padding(stats, (0, 2, 0, 2))
 
     def _render_progress_bar_row(self) -> Any:
@@ -585,7 +655,7 @@ class LogHandler(LogHandlerBase):
         two.add_row(left, right)
         return Padding(two, (0, 2, 0, 2))
 
-    def _render_section_title(self, text: str, right: Optional[Text] = None) -> Any:
+    def _render_section_title(self, text: str, right: Text | None = None) -> Any:
         tbl = Table.grid(expand=True, padding=(0, 1))
         tbl.add_column(no_wrap=True)
         tbl.add_column(ratio=1)
@@ -596,39 +666,66 @@ class LogHandler(LogHandlerBase):
         return tbl
 
     def _render_jobs_panel(self) -> Any:
+        n_running = len(self._active_jobs)
+        n_submitted = len(self._job_specs)
         right = Text()
-        right.append(f"{len(self._active_jobs)} running", style=C_AMBER)
+        right.append(f"{n_running} running", style=C_AMBER)
+        if n_submitted:
+            right.append(" · ", style=C_INK_FAINT)
+            right.append(f"{n_submitted} submitted", style=C_SKY)
         right.append(" · ", style=C_INK_FAINT)
         total = self._total_jobs
-        queued = max(0, total - self._jobs_done - self._jobs_failed - len(self._active_jobs))
+        queued = max(0, total - self._jobs_done - self._jobs_failed - n_running - n_submitted)
         right.append(f"{queued} queued", style=C_INK_SOFT)
         header = self._render_section_title("ACTIVE JOBS", right)
         rows: list[Any] = [header]
-        if not self._active_jobs:
-            rows.append(Padding(Text("  (no active jobs)", style=C_INK_FAINT), (0, 0, 0, 0)))
-        else:
-            spinner = _spinner_frame()
-            for jid in sorted(self._active_jobs.keys()):
-                je = self._active_jobs[jid]
-                rows.append(self._render_job_row(je, spinner))
+        with self._kb_lock:
+            f_active = self._filter_active
+            f_text = self._filter_text.lower()
+        spinner = _spinner_frame()
+        matched = 0
+        for jid in sorted(self._active_jobs.keys()):
+            je = self._active_jobs[jid]
+            if f_active and f_text and f_text not in f"{je.rule} {je.wildcards_str}".lower():
+                continue
+            matched += 1
+            rows.append(self._render_job_row(je, spinner, submitted=False))
+        for jid in sorted(self._job_specs.keys()):
+            je = self._job_specs[jid]
+            if f_active and f_text and f_text not in f"{je.rule} {je.wildcards_str}".lower():
+                continue
+            matched += 1
+            rows.append(self._render_job_row(je, "→", submitted=True))
+        if matched == 0:
+            if f_active and f_text:
+                rows.append(Padding(
+                    Text(f"  (no jobs matching \"{f_text}\")", style=C_INK_FAINT),
+                    (0, 0, 0, 0),
+                ))
+            else:
+                rows.append(Padding(Text("  (no active jobs)", style=C_INK_FAINT), (0, 0, 0, 0)))
         return Group(*rows)
 
-    def _render_job_row(self, je: _JobEntry, spinner: str) -> Any:
+    def _render_job_row(self, je: _JobEntry, spinner: str, submitted: bool = False) -> Any:
         elapsed = _mono_elapsed(time.time() - je.started_at)
+        with self._kb_lock:
+            show_res = self._verbose_override or bool(self.common_settings.verbose)
         row = Table.grid(expand=True, padding=(0, 1))
-        row.add_column(width=2, no_wrap=True)    # spinner
+        row.add_column(width=2, no_wrap=True)    # spinner / status icon
         row.add_column(width=5, no_wrap=True)    # #id
         row.add_column(ratio=1)                  # rule + wildcards
-        row.add_column(no_wrap=True)             # resources
+        row.add_column(no_wrap=True)             # resources (hidden unless verbose)
         row.add_column(width=6, no_wrap=True, justify="right")  # timer
-        spin = Text(spinner, style=C_AMBER)
+        spin = Text(spinner, style=C_SKY if submitted else C_AMBER)
         idt = Text(f"#{je.job_id:02d}", style=C_INK_FAINT)
         rule_txt = Text()
-        rule_txt.append(je.rule, style=f"bold {C_INK}")
+        name_style = C_INK_DIM if submitted else f"bold {C_INK}"
+        rule_txt.append(je.rule, style=name_style)
         if je.wildcards_str:
             rule_txt.append(f"  {je.wildcards_str}", style=C_INK_DIM)
-        res = Text(je.resources_str, style=C_INK_FAINT)
-        timer = Text(elapsed, style=C_AMBER)
+        res = Text(je.resources_str, style=C_INK_FAINT) if show_res else Text("")
+        timer_style = C_INK_DIM if submitted else C_AMBER
+        timer = Text(elapsed, style=timer_style)
         row.add_row(spin, idt, rule_txt, res, timer)
         return row
 
@@ -646,8 +743,7 @@ class LogHandler(LogHandlerBase):
         tbl.add_column(ratio=1)           # rule name
         tbl.add_column(width=16, no_wrap=True)  # bar
         tbl.add_column(width=11, no_wrap=True, justify="right")  # counts
-        # Stable sort: rules with running > failed > done-but-incomplete > done > pending
-        def sort_key(item):
+        def sort_key(item: tuple[str, _RuleStats]) -> tuple[int, str]:
             name, s = item
             touched = s.done + s.running + s.failed
             return (0 if s.running else 1 if touched and touched < s.total else 2 if s.failed else 3 if s.total and s.done == s.total else 4, name)
@@ -666,19 +762,30 @@ class LogHandler(LogHandlerBase):
         return tbl
 
     def _render_events_rows(self) -> Any:
+        with self._kb_lock:
+            f_active = self._filter_active
+            f_text = self._filter_text.lower()
         if not self._events:
             return Padding(Text("  (no events yet)", style=C_INK_FAINT), (0, 0, 0, 0))
         tbl = Table.grid(expand=True, padding=(0, 1))
         tbl.add_column(width=5, no_wrap=True)   # time
         tbl.add_column(width=1, no_wrap=True)   # glyph
         tbl.add_column(ratio=1)                 # message
-        glyph_color = {"info": C_SKY, "ok": C_SAGE, "warn": C_AMBER, "err": C_ROSE}
-        # Show the most-recent-first would flip the visual order; keep chronological.
+        glyph_color = {"info": C_SKY, "ok": C_LEAF, "warn": C_AMBER, "err": C_ROSE}
+        matched = 0
         for e in self._events:
+            if f_active and f_text:
+                plain = re.sub(r"\[/?[^\]]*\]", "", e.markup).lower()
+                if f_text not in plain:
+                    continue
+            matched += 1
             t = Text(e.t, style=C_INK_FAINT)
             g = Text(e.glyph, style=f"bold {glyph_color.get(e.kind, C_INK_DIM)}")
             m = Text.from_markup(e.markup)
             tbl.add_row(t, g, m)
+        if matched == 0:
+            msg = f"  (no events matching \"{f_text}\")" if (f_active and f_text) else "  (no events yet)"
+            return Padding(Text(msg, style=C_INK_FAINT), (0, 0, 0, 0))
         return tbl
 
     # ─── shell block ────────────────────────────────────────────────
@@ -694,7 +801,6 @@ class LogHandler(LogHandlerBase):
             right.append("  ·  ", style=C_INK_FAINT)
             right.append(job_ref, style=C_INK_DIM)
         title = self._render_section_title("LAST SHELL COMMAND", right)
-        # Use Syntax with word-wrap so long commands don't break the frame.
         syn = Syntax(
             cmd.strip(),
             "bash",
@@ -717,7 +823,7 @@ class LogHandler(LogHandlerBase):
             detail.append(f"{self._jobs_failed} jobs failed", style=f"bold {C_ROSE}")
             detail.append(f"  ·  {self._jobs_done} completed", style=C_INK_SOFT)
             if self._workflow_start_time:
-                detail.append(f"  ·  ", style=C_INK_DIM)
+                detail.append("  ·  ", style=C_INK_DIM)
                 detail.append(_mono_elapsed(time.time() - self._workflow_start_time), style=C_INK)
         else:
             style = C_LEAF
@@ -725,7 +831,7 @@ class LogHandler(LogHandlerBase):
             detail = Text()
             detail.append(f"{self._jobs_done} jobs finished", style=f"bold {C_LEAF}")
             if self._workflow_start_time:
-                detail.append(f"  in  ", style=C_INK_DIM)
+                detail.append("  in  ", style=C_INK_DIM)
                 detail.append(_mono_elapsed(time.time() - self._workflow_start_time), style=f"bold {C_INK}")
         body = Group(Text(title, style=f"bold {style}"), detail)
         p = Panel(body, border_style=style, padding=(0, 1), box=box.HEAVY)
@@ -743,6 +849,52 @@ class LogHandler(LogHandlerBase):
             return str(path)
         except Exception:
             return str(p)
+
+    def _maybe_update_job_from_slurm_msg(self, msg: str) -> None:
+        """Parse Slurm submission messages to back-fill rule/wildcard info.
+
+        The Slurm executor logs e.g.:
+          Job 22 has been submitted with SLURM jobid 48989767
+          (log: .../.snakemake/slurm_logs/rule_align_pe/TEAD1-2/48989767.log).
+        We extract the Snakemake job ID (22), the rule name (align_pe), and the
+        wildcard string (TEAD1-2) and update the already-running _JobEntry.
+        """
+        m = re.search(
+            r"Job\s+(\d+)\s+has been submitted.*?slurm_logs/rule_([^/]+)/([^/]+)/",
+            msg,
+        )
+        if not m:
+            return
+        jid = int(m.group(1))
+        rule = m.group(2)
+        wc = m.group(3)
+        je = self._active_jobs.get(jid)
+        was_in_active = je is not None
+        if je is None:
+            # With SLURM, JOB_STARTED never fires — jobs sit in _job_specs after JOB_INFO.
+            # The submission message is the SLURM equivalent of JOB_STARTED, so move the
+            # job into _active_jobs here.
+            je = self._job_specs.pop(jid, None)
+            if je is None:
+                return
+            je.started_at = time.time()
+            je.state = "running"
+            self._active_jobs[jid] = je
+        old_rule = je.rule
+        je.rule = rule
+        je.wildcards_str = wc
+        if old_rule != rule:
+            if was_in_active and old_rule in self._rule_stats and self._rule_stats[old_rule].running > 0:
+                self._bump_rule(old_rule, running_delta=-1)
+            self._bump_rule(rule, running_delta=1)
+        elif not was_in_active:
+            self._bump_rule(rule, running_delta=1)
+        if self._live is not None:
+            self._refresh()
+
+    def _is_quiet_rule(self, rule: str) -> bool:
+        quiet = self.common_settings.quiet
+        return bool(quiet and rule in quiet)
 
     def _push_event(self, glyph: str, kind: str, markup: str) -> None:
         self._events.append(_EventEntry(time.strftime("%H:%M"), glyph, kind, markup))
@@ -762,7 +914,6 @@ class LogHandler(LogHandlerBase):
         wid = getattr(record, "workflow_id", None)
         self._workflow_id = str(wid) if wid else None
         if self._snakefile:
-            # Derive a pretty workflow name from the parent directory.
             try:
                 self._workflow_name = Path(self._snakefile).parent.name or "workflow"
             except Exception:
@@ -770,27 +921,40 @@ class LogHandler(LogHandlerBase):
         self._workflow_start_time = time.time()
         dryrun = " [DRY RUN]" if self.common_settings.dryrun else ""
         self._push_event("i", "info", f"[bold]workflow started[/]{dryrun}")
-        # Print a one-line banner ABOVE the frame so scrollback has a marker.
-        self._print_above(Rule(Text(f"Workflow Started{dryrun}", style=f"bold {C_AMBER}"), style=C_AMBER))
+        self._add_log_line(Rule(Text(f"Workflow Started{dryrun}", style=f"bold {C_AMBER}"), style=C_AMBER))
+        # Do NOT start the TUI here — WORKFLOW_STARTED fires before DAG validation and
+        # resource checks. Starting the alternate screen this early swallows Snakemake's
+        # own stderr output and can cause silent failures. The TUI starts on the first
+        # JOB_INFO event, after Snakemake is ready to actually run jobs.
         if self._live is not None:
             self._refresh()
 
     def _handle_run_info(self, record: LogRecord) -> None:
-        per_rule: dict[str, int] = getattr(record, "per_rule_job_counts", {}) or {}
-        total: int = getattr(record, "total_job_count", 0) or 0
+        # Local executor: per_rule_job_counts + total_job_count
+        # Cluster executor (Slurm): stats dict with rule names and a 'total' key
+        per_rule: dict[str, int] | None = getattr(record, "per_rule_job_counts", None)
+        total: int | None = getattr(record, "total_job_count", None)
+        if per_rule is None:
+            raw = getattr(record, "stats", None)
+            if isinstance(raw, dict):
+                total = int(raw.get("total", 0))
+                per_rule = {k: int(v) for k, v in raw.items() if k != "total"}
+            else:
+                per_rule, total = {}, 0
+        per_rule = per_rule or {}
+        total = total or 0
         self._total_jobs = total
         for rule_name, count in per_rule.items():
             self._rule_stats.setdefault(rule_name, _RuleStats()).total = count
         self._push_event("i", "info",
                          f"resolved DAG · [bold]{total}[/] jobs across {len(per_rule)} rules")
-        # Print the job-count table once above the frame — useful for scrollback/CI logs.
         table = Table(title=None, box=box.SIMPLE, show_header=True, header_style=C_INK_DIM)
         table.add_column("Rule", style=C_AMBER, no_wrap=True)
         table.add_column("Jobs", justify="right", style=C_INK)
         for rule_name, count in sorted(per_rule.items()):
             table.add_row(rule_name, str(count))
         table.add_row("[bold]total[/]", f"[bold]{total}[/]")
-        self._print_above(table)
+        self._add_log_line(table)
         if self._live is not None:
             self._refresh()
 
@@ -800,13 +964,16 @@ class LogHandler(LogHandlerBase):
         if cores is not None:
             self._cores = cores
         if nodes:
-            self._nodes = list(nodes)
+            try:
+                self._nodes = list(nodes)
+            except TypeError:
+                self._nodes = [str(nodes)]
         provided = getattr(record, "provided_resources", None)
         parts = []
         if cores is not None:
             parts.append(f"{cores} cores")
-        if nodes:
-            parts.append(f"nodes {', '.join(nodes)}")
+        if self._nodes:
+            parts.append(f"nodes {', '.join(self._nodes)}")
         if provided:
             parts.append(f"resources {provided}")
         if parts:
@@ -818,6 +985,8 @@ class LogHandler(LogHandlerBase):
         if not self.common_settings.printshellcmds:
             return
         rule_name = getattr(record, "rule_name", None) or "?"
+        if self._is_quiet_rule(rule_name):
+            return
         shellcmd = getattr(record, "shellcmd", None)
         jobid = getattr(record, "jobid", None)
         if shellcmd:
@@ -855,9 +1024,7 @@ class LogHandler(LogHandlerBase):
             job_id=jobid, rule=rule_name, wildcards_str=wc_str,
             threads=threads, resources_str=res_str,
         )
-        # Ensure the rule appears in the rules list even if run_info didn't list it.
         self._rule_stats.setdefault(rule_name, _RuleStats())
-        # Verbose mode: dump a detail table into scrollback.
         if self.common_settings.verbose:
             header = Text()
             header.append(f"Job {jobid}  ", style=f"bold {C_AMBER}")
@@ -880,32 +1047,49 @@ class LogHandler(LogHandlerBase):
                 table.add_row("Reason", str(reason))
             shellcmd = getattr(record, "shellcmd", None)
             if shellcmd and self.common_settings.printshellcmds:
-                self._print_above(Panel(Group(table, Syntax(shellcmd, "bash", theme=self._syntax_theme)),
-                                        title=header, border_style=C_AMBER))
+                self._add_log_line(Panel(Group(table, Syntax(shellcmd, "bash", theme=self._syntax_theme)),
+                                         title=header, border_style=C_AMBER))
             else:
-                self._print_above(Panel(table, title=header, border_style=C_AMBER))
+                self._add_log_line(Panel(table, title=header, border_style=C_AMBER))
+        # Start the TUI now so cluster jobs show as "submitted" even if JOB_STARTED
+        # never fires (e.g. Slurm executor doesn't always emit it).
+        if self._workflow_start_time is None:
+            self._workflow_start_time = time.time()
+        self._ensure_live()
         if self._live is not None:
             self._refresh()
 
     def _handle_job_started(self, record: LogRecord) -> None:
-        job_ids: list[int] = getattr(record, "job_ids", []) or []
+        # Local executor uses 'job_ids'; Slurm executor uses 'jobs'.
+        raw = getattr(record, "jobs", None) or getattr(record, "job_ids", None) or []
+        job_ids: list[int] = list(raw) if raw else []
         self._ensure_live()
         for jid in job_ids:
             spec = self._job_specs.pop(jid, None) or _JobEntry(job_id=jid, rule=f"job_{jid}")
             spec.started_at = time.time()
             spec.state = "running"
             self._active_jobs[jid] = spec
-            self._bump_rule(spec.rule, running_delta=1)
-            self._push_event("▸", "ok", f"job [bold]#{jid}[/] started · [{C_AMBER}]{spec.rule}[/]")
+            # Only bump the rule counter if we have a real rule name; placeholder names
+            # get updated (and counted) later when the Slurm submission message arrives.
+            if spec.rule in self._rule_stats:
+                self._bump_rule(spec.rule, running_delta=1)
+            if not self._is_quiet_rule(spec.rule):
+                self._push_event("▸", "ok", f"job [bold]#{jid}[/] started · [{C_AMBER}]{spec.rule}[/]")
         self._refresh()
 
     def _handle_job_finished(self, record: LogRecord) -> None:
         job_id: int = getattr(record, "job_id", getattr(record, "jobid", -1))
+        # For cluster executors (e.g. Slurm), jobs may complete without passing
+        # through _active_jobs if JOB_STARTED was never emitted — check _job_specs too.
         je = self._active_jobs.pop(job_id, None)
+        was_running = je is not None
+        if je is None:
+            je = self._job_specs.pop(job_id, None)
         if je is not None:
-            self._bump_rule(je.rule, running_delta=-1, done_delta=1)
-            dur = _mono_elapsed(time.time() - je.started_at)
-            self._push_event("✓", "ok", f"job [bold]#{job_id}[/] finished · [{C_AMBER}]{je.rule}[/] [dim]in {dur}[/]")
+            self._bump_rule(je.rule, running_delta=-1 if was_running else 0, done_delta=1)
+            if not self._is_quiet_rule(je.rule):
+                dur = _mono_elapsed(time.time() - je.started_at)
+                self._push_event("✓", "ok", f"job [bold]#{job_id}[/] finished · [{C_AMBER}]{je.rule}[/] [dim]in {dur}[/]")
         else:
             self._push_event("✓", "ok", f"job [bold]#{job_id}[/] finished")
         self._jobs_done += 1
@@ -916,17 +1100,21 @@ class LogHandler(LogHandlerBase):
     def _handle_job_error(self, record: LogRecord) -> None:
         jobid: int = getattr(record, "jobid", -1)
         je = self._active_jobs.pop(jobid, None)
+        was_running = je is not None
+        if je is None:
+            je = self._job_specs.pop(jobid, None)
         if je is not None:
-            self._bump_rule(je.rule, running_delta=-1, failed_delta=1)
-            self._push_event("✗", "err", f"job [bold]#{jobid}[/] [bold {C_ROSE}]failed[/] · [{C_AMBER}]{je.rule}[/]")
+            self._bump_rule(je.rule, running_delta=-1 if was_running else 0, failed_delta=1)
+            if not self._is_quiet_rule(je.rule):
+                self._push_event("✗", "err", f"job [bold]#{jobid}[/] [bold {C_ROSE}]failed[/] · [{C_AMBER}]{je.rule}[/]")
         else:
             self._push_event("✗", "err", f"job [bold]#{jobid}[/] [bold {C_ROSE}]failed[/]")
         self._jobs_failed += 1
-        # Also print a compact error banner above the frame.
-        self._print_above(Panel(
-            Text(f"Job {jobid} failed", style=f"bold {C_ROSE}"),
-            border_style=C_ROSE, title=Text("Job Error", style=f"bold {C_ROSE}"),
-        ))
+        if je is None or not self._is_quiet_rule(je.rule):
+            self._add_log_line(Panel(
+                Text(f"Job {jobid} failed", style=f"bold {C_ROSE}"),
+                border_style=C_ROSE, title=Text("Job Error", style=f"bold {C_ROSE}"),
+            ))
         if self._live is not None:
             self._refresh()
 
@@ -947,8 +1135,8 @@ class LogHandler(LogHandlerBase):
         if aux_logs and self.common_settings.show_failed_logs:
             for log in aux_logs:
                 lines.append(Text(str(log), style=C_INK_SOFT))
-        self._print_above(Panel(Group(*lines), title=Text("Group Error", style=f"bold {C_ROSE}"),
-                                border_style=C_ROSE))
+        self._add_log_line(Panel(Group(*lines), title=Text("Group Error", style=f"bold {C_ROSE}"),
+                                 border_style=C_ROSE))
         if self._live is not None:
             self._refresh()
 
@@ -958,13 +1146,11 @@ class LogHandler(LogHandlerBase):
         if total > 0:
             self._total_jobs = total
             self._ensure_live()
-        # If Snakemake reports a done count we haven't seen job-by-job, sync up.
         if done > self._jobs_done:
             self._jobs_done = done
         if self._live is not None:
             self._refresh()
         if total > 0 and done >= total:
-            # Finalize: freeze a summary inside the frame, then tear down Live.
             self._finished = True
             if self._live is not None:
                 self._refresh()
@@ -993,7 +1179,7 @@ class LogHandler(LogHandlerBase):
             parts.append(Text(msg, style=C_ROSE))
         if traceback_str:
             parts.append(Syntax(str(traceback_str), "python", theme=self._syntax_theme))
-        self._print_above(Panel(
+        self._add_log_line(Panel(
             Group(*parts) if parts else Text("An error occurred", style=C_ROSE),
             title=Text("Error", style=f"bold {C_ROSE}"),
             border_style=C_ROSE,
@@ -1007,10 +1193,7 @@ class LogHandler(LogHandlerBase):
             return
         status = getattr(record, "status", "")
         file_ = getattr(record, "file", "")
-        self._print_above(Text(f"[DAG] {status} {file_}", style=C_INK_DIM))
-
-    def _handle_rulegraph(self, record: LogRecord) -> None:
-        pass  # not implemented
+        self._add_log_line(Text(f"[DAG] {status} {file_}", style=C_INK_DIM))
 
     # ─── final summary ──────────────────────────────────────────────
 
@@ -1024,13 +1207,17 @@ class LogHandler(LogHandlerBase):
             body.append(f"{self._jobs_failed} job(s) failed", style=f"bold {C_ROSE}")
             body.append(", ", style=C_INK_DIM)
             body.append(f"{self._jobs_done} completed{elapsed_str}", style=C_INK_SOFT)
-            self._print_above(Panel(body, title=Text("Workflow Failed", style=f"bold {C_ROSE}"),
-                                    border_style=C_ROSE))
+            summary = Panel(body, title=Text("Workflow Failed", style=f"bold {C_ROSE}"),
+                            border_style=C_ROSE)
         else:
             body = Text()
             body.append(f"{self._jobs_done} job(s) completed{elapsed_str}", style=f"bold {C_LEAF}")
-            self._print_above(Panel(body, title=Text("Workflow Complete", style=f"bold {C_LEAF}"),
-                                    border_style=C_LEAF))
+            summary = Panel(body, title=Text("Workflow Complete", style=f"bold {C_LEAF}"),
+                            border_style=C_LEAF)
+        # In TTY/TUI mode: summary is already visible in the final TUI frame (_render_summary).
+        # Only print to the terminal in non-TTY mode (CI, pipes) for log file capture.
+        if not self.console.is_terminal:
+            self._print_above(summary)
         # Reset counters so a subsequent run in the same process starts clean.
         self._jobs_done = 0
         self._jobs_failed = 0
@@ -1040,6 +1227,7 @@ class LogHandler(LogHandlerBase):
         self._job_specs.clear()
         self._rule_stats.clear()
         self._events.clear()
+        self._log_lines.clear()
         self._spark_history.clear()
         self._completion_times.clear()
         self._total_jobs = 0
