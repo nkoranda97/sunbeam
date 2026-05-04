@@ -100,6 +100,7 @@ class LogHandler(LogHandlerBase):
         self._active_jobs: dict[int, _JobEntry] = {}
         self._job_specs: dict[int, _JobEntry] = {}   # seen via JOB_INFO but not yet started
         self._rule_stats: dict[str, _RuleStats] = {}
+        self._rule_order: list[str] = []             # rules in dispatch order
         self._total_jobs: int = 0
         self._jobs_done: int = 0
         self._jobs_failed: int = 0
@@ -573,7 +574,10 @@ class LogHandler(LogHandlerBase):
             if self._jobs_failed > 0:
                 return Text(" FAILED ", style=f"bold {C_ROSE} on #2a1410")
             return Text(" COMPLETE ", style=f"bold {C_LEAF} on #18200d")
-        if self._workflow_start_time is None:
+        if (self._workflow_start_time is None
+                and not self._active_jobs
+                and not self._job_specs
+                and not self._total_jobs):
             return Text(" IDLE ", style=f"bold {C_INK_DIM} on {C_LINE}")
         if self._total_jobs == 0:
             return Text(" STARTING ", style=f"bold {C_AMBER} on #2a1f0a")
@@ -753,11 +757,10 @@ class LogHandler(LogHandlerBase):
         tbl.add_column(ratio=1)           # rule name
         tbl.add_column(width=16, no_wrap=True)  # bar
         tbl.add_column(width=11, no_wrap=True, justify="right")  # counts
-        def sort_key(item: tuple[str, _RuleStats]) -> tuple[int, str]:
-            name, s = item
-            touched = s.done + s.running + s.failed
-            return (0 if s.running else 1 if touched and touched < s.total else 2 if s.failed else 3 if s.total and s.done == s.total else 4, name)
-        for name, s in sorted(self._rule_stats.items(), key=sort_key):
+        ordered = [n for n in self._rule_order if n in self._rule_stats]
+        remaining = [n for n in self._rule_stats if n not in set(self._rule_order)]
+        for name in ordered + remaining:
+            s = self._rule_stats[name]
             name_style = C_INK if s.running else C_INK_SOFT
             name_txt = Text(name, style=name_style, overflow="ellipsis", no_wrap=True)
             if s.running:
@@ -893,12 +896,17 @@ class LogHandler(LogHandlerBase):
         old_rule = je.rule
         je.rule = rule
         je.wildcards_str = wc
+        if rule not in self._rule_order:
+            self._rule_order.append(rule)
         if old_rule != rule:
             if was_in_active and old_rule in self._rule_stats and self._rule_stats[old_rule].running > 0:
                 self._bump_rule(old_rule, running_delta=-1)
             self._bump_rule(rule, running_delta=1)
         elif not was_in_active:
             self._bump_rule(rule, running_delta=1)
+        if self._workflow_start_time is None:
+            self._workflow_start_time = time.time()
+        self._ensure_live()
         if self._live is not None:
             self._refresh()
 
@@ -954,6 +962,8 @@ class LogHandler(LogHandlerBase):
         per_rule = per_rule or {}
         total = total or 0
         self._total_jobs = total
+        if self._workflow_start_time is None:
+            self._workflow_start_time = time.time()
         for rule_name, count in per_rule.items():
             self._rule_stats.setdefault(rule_name, _RuleStats()).total = count
         self._push_event("i", "info",
@@ -1035,6 +1045,8 @@ class LogHandler(LogHandlerBase):
             threads=threads, resources_str=res_str,
         )
         self._rule_stats.setdefault(rule_name, _RuleStats())
+        if rule_name not in self._rule_order:
+            self._rule_order.append(rule_name)
         if self.common_settings.verbose:
             header = Text()
             header.append(f"Job {jobid}  ", style=f"bold {C_AMBER}")
@@ -1234,6 +1246,7 @@ class LogHandler(LogHandlerBase):
         self._active_jobs.clear()
         self._job_specs.clear()
         self._rule_stats.clear()
+        self._rule_order.clear()
         self._events.clear()
         self._log_lines.clear()
         self._spark_history.clear()

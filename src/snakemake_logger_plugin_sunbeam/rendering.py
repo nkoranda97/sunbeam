@@ -4,7 +4,7 @@ import time
 
 from rich.text import Text
 
-from .settings import C_AMBER, C_GOLD, C_ROSE, SPARK_BLOCKS
+from .settings import C_AMBER, C_LEAF, C_ROSE, SPARK_BLOCKS
 
 
 def _mono_elapsed(secs: float) -> str:
@@ -28,11 +28,11 @@ def _sparkline(values: list[float], width: int = 24) -> Text:
         else:
             idx = min(len(SPARK_BLOCKS) - 1, int((v / peak) * (len(SPARK_BLOCKS) - 1)) + 1)
         chars.append(SPARK_BLOCKS[idx])
-    return Text("".join(chars), style=C_AMBER)
+    return Text("".join(chars), style=C_LEAF)
 
 
 def _progress_bar_markup(done: int, running: int, failed: int, total: int, width: int = 48) -> Text:
-    """Solid progress bar: amber (done) + gold (running) + rose (failed)."""
+    """Solid progress bar: leaf/green (done) + amber (running) + rose (failed)."""
     total = max(total, 1)
     done_cells = round(done / total * width)
     fail_cells = round(failed / total * width)
@@ -48,8 +48,8 @@ def _progress_bar_markup(done: int, running: int, failed: int, total: int, width
         overflow -= trim
         done_cells -= overflow
     bar = Text()
-    bar.append("█" * done_cells, style=C_AMBER)
-    bar.append("█" * run_cells,  style=C_GOLD)
+    bar.append("█" * done_cells, style=C_LEAF)
+    bar.append("█" * run_cells,  style=C_AMBER)
     bar.append("█" * fail_cells, style=C_ROSE)
     return bar
 
