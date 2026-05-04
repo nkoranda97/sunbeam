@@ -20,7 +20,7 @@ pip install snakemake-logger-plugin-sunbeam
 Or in development:
 
 ```bash
-git clone https://github.com/you/sunbeam
+git clone https://github.com/nkoranda/sunbeam
 cd sunbeam
 uv sync
 ```
@@ -58,7 +58,7 @@ snakemake --logger sunbeam --dryrun
 
 ```bash
 uv sync          # install deps + dev deps
-uv run pytest -v # run the test suite (29 tests)
+uv run pytest -v # run the test suite (44 tests)
 ```
 
 The test suite uses `Console(record=True)` to capture rendered output and assert on

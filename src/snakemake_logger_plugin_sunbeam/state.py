@@ -12,7 +12,6 @@ class _JobEntry:
     threads: int = 1
     resources_str: str = ""
     started_at: float = field(default_factory=time.time)
-    state: str = "running"   # running | done | fail | queued
 
 
 @dataclass

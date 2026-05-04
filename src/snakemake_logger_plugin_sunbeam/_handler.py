@@ -59,6 +59,9 @@ from .settings import (
 )
 from .state import _EventEntry, _JobEntry, _RuleStats
 
+_SCROLL_BOTTOM = 999999   # sentinel: clamped to scroll_max on first render
+_SCROLL_STEP   = 3
+
 
 class LogHandler(LogHandlerBase):
     def __init__(
@@ -121,7 +124,7 @@ class LogHandler(LogHandlerBase):
         self._log_lines: deque[Any] = deque(maxlen=20)
 
         # Scroll state (viewport into the rendered panel)
-        self._scroll_offset: int = 999999  # clamped to max on first render → starts at bottom
+        self._scroll_offset: int = _SCROLL_BOTTOM  # clamped to max on first render → starts at bottom
         self._scroll_max: int = 0
 
         # Last shell command (rule, cmd, job ref)
@@ -304,13 +307,13 @@ class LogHandler(LogHandlerBase):
                     self._filter_active = True
                     self._filter_text = ""
                 elif ch == "j":
-                    self._scroll_offset = min(self._scroll_offset + 3, 999999)
+                    self._scroll_offset = min(self._scroll_offset + _SCROLL_STEP, _SCROLL_BOTTOM)
                 elif ch == "k":
-                    self._scroll_offset = max(0, self._scroll_offset - 3)
+                    self._scroll_offset = max(0, self._scroll_offset - _SCROLL_STEP)
                 elif ch == "g":
                     self._scroll_offset = 0
                 elif ch == "G":
-                    self._scroll_offset = 999999
+                    self._scroll_offset = _SCROLL_BOTTOM
         self._refresh()
 
     # ─── log pane ────────────────────────────────────────────────────
@@ -891,7 +894,6 @@ class LogHandler(LogHandlerBase):
             if je is None:
                 return
             je.started_at = time.time()
-            je.state = "running"
             self._active_jobs[jid] = je
         old_rule = je.rule
         je.rule = rule
@@ -1089,7 +1091,6 @@ class LogHandler(LogHandlerBase):
         for jid in job_ids:
             spec = self._job_specs.pop(jid, None) or _JobEntry(job_id=jid, rule=f"job_{jid}")
             spec.started_at = time.time()
-            spec.state = "running"
             self._active_jobs[jid] = spec
             # Only bump the rule counter if we have a real rule name; placeholder names
             # get updated (and counted) later when the Slurm submission message arrives.
@@ -1167,6 +1168,8 @@ class LogHandler(LogHandlerBase):
         total: int = getattr(record, "total", 0) or 0
         if total > 0:
             self._total_jobs = total
+            if self._workflow_start_time is None:
+                self._workflow_start_time = time.time()
             self._ensure_live()
         if done > self._jobs_done:
             self._jobs_done = done
@@ -1273,4 +1276,4 @@ class LogHandler(LogHandlerBase):
 
     @property
     def needs_rulegraph(self) -> bool:
-        return False
+        return False  # intentionally unused — sunbeam derives its rule table from JOB_INFO events

@@ -46,7 +46,7 @@ def _progress_bar_markup(done: int, running: int, failed: int, total: int, width
         trim = min(overflow, fail_cells)
         fail_cells -= trim
         overflow -= trim
-        done_cells -= overflow
+        done_cells = max(0, done_cells - overflow)
     bar = Text()
     bar.append("█" * done_cells, style=C_LEAF)
     bar.append("█" * run_cells,  style=C_AMBER)

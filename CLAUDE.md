@@ -11,8 +11,8 @@ Sunbeam is a Snakemake logger plugin that uses `rich` for beautiful, informative
 This project uses `uv` for dependency management (Python 3.14).
 
 ```bash
-uv sync          # Install dependencies
-uv run main.py   # Run the entry point
+uv sync                                                    # Install dependencies
+uv run python -m snakemake_logger_plugin_sunbeam.demo      # Run the interactive demo
 ```
 
 ## Architecture
