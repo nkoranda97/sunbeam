@@ -38,9 +38,10 @@ snakemake --logger sunbeam
 | Flag | Effect |
 |---|---|
 | `--logger-sunbeam-theme <name>` | Pygments syntax theme for code blocks (default: `monokai`) |
+| `--logger-sunbeam-hold-on-complete` | Keep the final full-screen TUI open until `q` is pressed |
 | `--printshellcmds` | Show shell commands as syntax-highlighted blocks |
 | `--verbose` | Show full job detail tables (inputs, outputs, wildcards, resources) |
-| `--quiet` | Suppress job output for specified rules |
+| `--quiet` | Suppress Snakemake log categories such as `rules`, `progress`, or `all` |
 | `--dryrun` | Adds a `[DRY RUN]` label to the workflow banner |
 | `--nocolor` | Disable all colour output |
 
@@ -58,7 +59,7 @@ snakemake --logger sunbeam --dryrun
 
 ```bash
 uv sync          # install deps + dev deps
-uv run pytest -v # run the test suite (44 tests)
+uv run pytest -v # run the test suite (48 unit + 3 smoke = 51 tests)
 ```
 
 The test suite uses `Console(record=True)` to capture rendered output and assert on

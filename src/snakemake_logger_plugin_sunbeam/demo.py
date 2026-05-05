@@ -30,9 +30,14 @@ WORKFLOW_ID = uuid.UUID("7a4f784f-b11d-46dd-8fd3-9db91a79c851")
 
 def _settings(**overrides: Any) -> SimpleNamespace:
     s = SimpleNamespace(
-        stdout=False, nocolor=False, verbose=False,
-        printshellcmds=True, dryrun=False, quiet=None,
-        show_failed_logs=True, debug_dag=False,
+        stdout=False,
+        nocolor=False,
+        verbose=False,
+        printshellcmds=True,
+        dryrun=False,
+        quiet=None,
+        show_failed_logs=True,
+        debug_dag=False,
     )
     for k, v in overrides.items():
         setattr(s, k, v)
@@ -64,10 +69,7 @@ SAMPLES = ["HBR_Rep1", "HBR_Rep2", "UHR_Rep1", "UHR_Rep2"]
 SHELLCMDS = {
     "prep_reference": "gffread annotation.gtf -g ref.fa -w transcripts.fa",
     "fastqc_raw": "fastqc -o results/qc/raw {input}",
-    "trim_adapters": (
-        "cutadapt -a AGATCGGAAGAGC -A AGATCGGAAGAGC "
-        "-o {output.r1} -p {output.r2} {input.r1} {input.r2}"
-    ),
+    "trim_adapters": ("cutadapt -a AGATCGGAAGAGC -A AGATCGGAAGAGC -o {output.r1} -p {output.r2} {input.r1} {input.r2}"),
     "fastqc_trimmed": "fastqc -o results/qc/trimmed {input}",
     "salmon_quant": (
         "salmon quant -i resources/salmon_index --libType A "
@@ -241,25 +243,33 @@ class DemoController:
 
     def _seed_workflow(self, handler: DemoLogHandler, stage: DemoStage) -> None:
         total = len(self._jobs)
-        handler.emit(_rec(
-            LogEvent.WORKFLOW_STARTED,
-            snakefile="./rnaseq-quant/Snakefile",
-            workflow_id=WORKFLOW_ID,
-        ))
+        handler.emit(
+            _rec(
+                LogEvent.WORKFLOW_STARTED,
+                snakefile="./rnaseq-quant/Snakefile",
+                workflow_id=WORKFLOW_ID,
+            )
+        )
         handler.emit(_rec(LogEvent.RUN_INFO, per_rule_job_counts=RULES, total_job_count=total))
         handler.emit(_rec(LogEvent.RESOURCES_INFO, cores=8, nodes=["demo-node-01"]))
         handler.emit(_rec(LogEvent.PROGRESS, done=0, total=total))
-        handler.emit(logging.LogRecord(
-            "snakemake", logging.INFO, "demo.py", 1,
-            f"Demo stage: {stage.label} ({idx_label(self._stage_idx)})", (), None,
-        ))
+        handler.emit(
+            logging.LogRecord(
+                "snakemake",
+                logging.INFO,
+                "demo.py",
+                1,
+                f"Demo stage: {stage.label} ({idx_label(self._stage_idx)})",
+                (),
+                None,
+            )
+        )
 
         failed_ids = {FAILURE_TARGET} if stage.failed else set()
-        done_jobs = [j for j in self._jobs if j["id"] not in failed_ids][:stage.done]
-        running_jobs = [
-            j for j in self._jobs
-            if j["id"] not in {d["id"] for d in done_jobs} | failed_ids
-        ][:stage.running]
+        done_jobs = [j for j in self._jobs if j["id"] not in failed_ids][: stage.done]
+        running_jobs = [j for j in self._jobs if j["id"] not in {d["id"] for d in done_jobs} | failed_ids][
+            : stage.running
+        ]
 
         for job in done_jobs:
             self._start_job(handler, job)
@@ -272,12 +282,14 @@ class DemoController:
             failed_job = self._jobs[FAILURE_TARGET - 1]
             self._start_job(handler, failed_job)
             handler.emit(_rec(LogEvent.JOB_ERROR, jobid=FAILURE_TARGET))
-            handler.emit(_rec(
-                LogEvent.ERROR,
-                exception="MissingInputException: results/quant/HBR_Rep2/quant.sf",
-                rule=failed_job["rule"],
-                traceback="Traceback (most recent call last):\n  demo workflow failed intentionally",
-            ))
+            handler.emit(
+                _rec(
+                    LogEvent.ERROR,
+                    exception="MissingInputException: results/quant/HBR_Rep2/quant.sf",
+                    rule=failed_job["rule"],
+                    traceback="Traceback (most recent call last):\n  demo workflow failed intentionally",
+                )
+            )
 
         progress_done = len(done_jobs) + len(failed_ids)
         if stage.complete:
@@ -289,12 +301,14 @@ class DemoController:
     def _start_job(self, handler: DemoLogHandler, job: dict[str, Any]) -> None:
         fields = _job_fields(job)
         handler.emit(_rec(LogEvent.JOB_INFO, **fields))
-        handler.emit(_rec(
-            LogEvent.SHELLCMD,
-            shellcmd=SHELLCMDS.get(job["rule"], "echo hi"),
-            rule_name=job["rule"],
-            jobid=job["id"],
-        ))
+        handler.emit(
+            _rec(
+                LogEvent.SHELLCMD,
+                shellcmd=SHELLCMDS.get(job["rule"], "echo hi"),
+                rule_name=job["rule"],
+                jobid=job["id"],
+            )
+        )
         handler.emit(_rec(LogEvent.JOB_STARTED, job_ids=[job["id"]]))
 
 

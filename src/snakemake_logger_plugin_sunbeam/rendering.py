@@ -36,7 +36,7 @@ def _progress_bar_markup(done: int, running: int, failed: int, total: int, width
     total = max(total, 1)
     done_cells = round(done / total * width)
     fail_cells = round(failed / total * width)
-    run_cells  = round(running / total * width)
+    run_cells = round(running / total * width)
     used = done_cells + fail_cells + run_cells
     if used > width:
         overflow = used - width
@@ -49,7 +49,7 @@ def _progress_bar_markup(done: int, running: int, failed: int, total: int, width
         done_cells = max(0, done_cells - overflow)
     bar = Text()
     bar.append("█" * done_cells, style=C_LEAF)
-    bar.append("█" * run_cells,  style=C_AMBER)
+    bar.append("█" * run_cells, style=C_AMBER)
     bar.append("█" * fail_cells, style=C_ROSE)
     return bar
 

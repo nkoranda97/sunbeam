@@ -24,7 +24,7 @@ class _RuleStats:
 
 @dataclass
 class _EventEntry:
-    t: str       # "HH:MM"
-    glyph: str   # "▸" "✓" "✗" "!" "i"
-    kind: str    # info | ok | warn | err
+    timestamp: str  # "HH:MM"
+    glyph: str  # "▸" "✓" "✗" "!" "i"
+    kind: str  # info | ok | warn | err
     markup: str  # rich markup
