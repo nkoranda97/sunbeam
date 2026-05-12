@@ -138,9 +138,6 @@ class LogHandler(LogHandlerBase):
         # Syntax theme
         self._syntax_theme: str = self.settings.theme if self.settings and self.settings.theme else "monokai"
 
-        # ETA smoothing
-        self._eta_secs: float | None = None
-
         # Summary flag — once the workflow ends, we freeze the frame.
         self._finished: bool = False
 
@@ -360,21 +357,6 @@ class LogHandler(LogHandlerBase):
     def _peak_throughput(self) -> float:
         return max(self._spark_history) if self._spark_history else 0.0
 
-    def _compute_eta(self) -> float | None:
-        """Exponential moving average on jobs/sec, smoothed against remaining."""
-        if not self._workflow_start_time or self._total_jobs <= 0:
-            return None
-        remaining = self._total_jobs - self._jobs_done - self._jobs_failed
-        if remaining <= 0:
-            return 0.0
-        elapsed = time.time() - self._workflow_start_time
-        if self._jobs_done <= 0 or elapsed <= 0:
-            return None
-        rate = self._jobs_done / elapsed
-        if rate <= 0:
-            return None
-        return remaining / rate
-
     # ─── frame rendering ──────────────────────────────────────────────
 
     def _build_panel(self) -> Panel:
@@ -562,12 +544,8 @@ class LogHandler(LogHandlerBase):
 
         right = Text(justify="right")
         elapsed = _mono_elapsed(time.time() - self._workflow_start_time) if self._workflow_start_time else "—"
-        eta = self._compute_eta()
-        eta_str = _mono_elapsed(eta) if (eta is not None and eta > 0) else "—"
         right.append("elapsed ", style=C_INK_FAINT)
         right.append(elapsed, style=f"bold {C_INK}")
-        right.append("   eta ", style=C_INK_FAINT)
-        right.append(eta_str, style=f"bold {C_AMBER if eta and eta > 0 else C_INK_DIM}")
 
         layout = Table.grid(expand=True, padding=(0, 2))
         layout.add_column(ratio=1)
@@ -636,10 +614,6 @@ class LogHandler(LogHandlerBase):
         if failed:
             caption.append(f"{failed} failed", style=C_ROSE)
             caption.append("  ·  ", style=C_INK_DIM)
-        eta = self._compute_eta()
-        if eta is not None and eta > 0:
-            caption.append("eta ", style=C_INK_FAINT)
-            caption.append(_mono_elapsed(eta), style=f"bold {C_AMBER}")
         g = Group(bar, caption)
         return Padding(g, (0, 2, 0, 2))
 
